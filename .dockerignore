@@ -1,0 +1,17 @@
+.git
+.nado
+node_modules
+.env
+.env.*
+!.env.example
+.claude
+.claude.json
+nado-worker-*.zip
+*.log
+coverage
+tmp
+downloads
+task-output
+session-output
+batch-output
+demo-output

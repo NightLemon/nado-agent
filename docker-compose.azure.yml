@@ -1,0 +1,35 @@
+services:
+  control:
+    build: .
+    image: nado-agent:azure
+    command:
+      - control
+      - start
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --data-dir
+      - /data/control
+    ports:
+      - target: 8765
+        published: "${NADO_DOCKER_PORT:-8765}"
+        host_ip: "${NADO_DOCKER_HOST_IP:-0.0.0.0}"
+        protocol: tcp
+    environment:
+      NADO_TOKEN: ${NADO_TOKEN:?Set NADO_TOKEN in .env}
+      NADO_ADMIN_TOKENS: ${NADO_ADMIN_TOKENS:-}
+      NADO_STORE: ${NADO_STORE:-sqlite}
+      NADO_INTERNAL_CONTROL_URL: http://127.0.0.1:8765
+      NADO_PUBLIC_CONTROL_URL: ${NADO_PUBLIC_CONTROL_URL:?Set NADO_PUBLIC_CONTROL_URL in .env}
+    volumes:
+      - nado-control-data:/data/control
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8765/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  nado-control-data:

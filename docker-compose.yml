@@ -1,0 +1,109 @@
+services:
+  control:
+    build: .
+    image: nado-agent:local
+    command:
+      - control
+      - start
+      - --host
+      - ${NADO_HOST:-0.0.0.0}
+      - --port
+      - "8765"
+      - --data-dir
+      - /data/control
+      - --token
+      - ${NADO_TOKEN:-docker-demo-token}
+    ports:
+      - target: 8765
+        published: "${NADO_DOCKER_PORT:-59610}"
+        host_ip: "${NADO_DOCKER_HOST_IP:-0.0.0.0}"
+        protocol: tcp
+    environment:
+      NADO_INTERNAL_CONTROL_URL: http://127.0.0.1:8765
+      NADO_DASHBOARD_AUTO_TOKEN: "true"
+      NADO_PUBLIC_CONTROL_URL: ${NADO_PUBLIC_CONTROL_URL:-}
+    volumes:
+      - nado-control-data:/data/control
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8765/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  worker-code:
+    image: nado-agent:local
+    build: .
+    depends_on:
+      control:
+        condition: service_healthy
+    environment:
+      NADO_TOKEN: ${NADO_TOKEN:-docker-demo-token}
+    command:
+      - worker
+      - start
+      - --control
+      - http://control:8765
+      - --id
+      - docker-code
+      - --capability
+      - code
+      - --capability
+      - docs
+      - --capability
+      - ppt
+      - --label
+      - zone=docker
+      - --label
+      - role=builder
+      - --agent
+      - claude
+      - --max-concurrency
+      - "2"
+      - --poll-ms
+      - "500"
+      - --data-dir
+      - /data/worker
+    volumes:
+      - nado-worker-code-data:/data/worker
+      - "${USERPROFILE}/.claude:/root/.claude"
+      - "./.nado/claude-container/settings.json:/root/.claude/settings.json:ro"
+      - "${USERPROFILE}/.claude.json:/root/.claude.json"
+
+  worker-gpu:
+    image: nado-agent:local
+    build: .
+    depends_on:
+      control:
+        condition: service_healthy
+    environment:
+      NADO_TOKEN: ${NADO_TOKEN:-docker-demo-token}
+    command:
+      - worker
+      - start
+      - --control
+      - http://control:8765
+      - --id
+      - docker-gpu
+      - --capability
+      - gpu
+      - --capability
+      - code
+      - --label
+      - zone=docker
+      - --label
+      - role=accelerator
+      - --agent
+      - node-copy
+      - --max-concurrency
+      - "1"
+      - --poll-ms
+      - "500"
+      - --data-dir
+      - /data/worker
+    volumes:
+      - nado-worker-gpu-data:/data/worker
+
+volumes:
+  nado-control-data:
+  nado-worker-code-data:
+  nado-worker-gpu-data:

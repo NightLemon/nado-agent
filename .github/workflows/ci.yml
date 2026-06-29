@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Scan publishable source for secrets
+        run: |
+          ! rg -n --hidden -S "(OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|AZURE_.*SECRET|api[_-]?key\s*[:=]|password\s*[:=]|-----BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY-----|ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AKIA[0-9A-Z]{16})" \
+            -g "!.git" \
+            -g "!.nado" \
+            -g "!node_modules" \
+            -g "!docs/github-readiness.md" \
+            -g "!.github/workflows/ci.yml"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate production compose
+        env:
+          NADO_TOKEN: local-ci-token
+          NADO_PUBLIC_CONTROL_URL: https://nado.example.com
+        run: docker compose -f docker-compose.azure.yml config
+      - name: Build image
+        run: docker build -t nado-agent:ci .

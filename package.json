@@ -1,0 +1,24 @@
+{
+  "name": "nado-agent",
+  "version": "0.1.0",
+  "description": "A minimal multi-machine agent task coordinator with a control plane and worker clients.",
+  "type": "module",
+  "bin": {
+    "nado": "./src/cli.js"
+  },
+  "scripts": {
+    "demo": "node ./src/demo.js",
+    "test": "node --test",
+    "quickstart": "node ./src/cli.js quickstart",
+    "mcp": "node ./src/cli.js mcp",
+    "start:control": "node ./src/cli.js control start",
+    "start:worker": "node ./src/cli.js worker start"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "sql.js": "^1.11.0"
+  }
+}

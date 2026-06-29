@@ -1,0 +1,27 @@
+.nado/
+node_modules/
+
+# Local operator secrets and runtime configuration.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+.claude/
+.claude.json
+
+# Runtime output, downloaded artifacts, and generated worker packages.
+downloads/
+task-output/
+session-output/
+batch-output/
+demo-output/
+nado-worker-*.zip
+*.log
+npm-debug.log*
+coverage/
+tmp/

@@ -1,0 +1,28 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - gnupg
+
+write_files:
+  - path: /opt/nado-agent/.env.example
+    permissions: "0600"
+    content: |
+      NADO_TOKEN=replace-with-a-long-random-admin-token
+      NADO_PUBLIC_CONTROL_URL=https://nado.example.com
+      NADO_DOCKER_PORT=8765
+      NADO_STORE=sqlite
+      NADO_DOCKER_HOST_IP=0.0.0.0
+
+runcmd:
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - sh -c '. /etc/os-release && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list'
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+  - echo "Clone the repository into /opt/nado-agent, copy .env.example to .env, set real values, then run docker compose -f docker-compose.azure.yml up -d --build" > /opt/nado-agent/README-next-steps.txt
