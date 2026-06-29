@@ -20,6 +20,8 @@ export const MCP_TOOL_NAMES = [
   'nado_list_tasks',
   'nado_prune_system_history',
   'nado_plan_batch',
+  'nado_plan_distributed_task',
+  'nado_run_distributed_task',
   'nado_submit_batch',
   'nado_run_batch',
   'nado_plan_dispatch',

@@ -157,6 +157,8 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_submit_batch'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_run_batch'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_plan_batch'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'nado_plan_distributed_task'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'nado_run_distributed_task'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_plan_dispatch'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_get_batch'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_wait_batch'));
@@ -177,6 +179,12 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.equal(runBatchTool.inputSchema.properties.includeReport.type, 'boolean');
     assert.equal(runBatchTool.inputSchema.properties.includeArtifactContent.type, 'boolean');
     assert.equal(runBatchTool.inputSchema.properties.defaults.properties.requireRoutable.type, 'boolean');
+    const planDistributedTool = tools.tools.find((tool) => tool.name === 'nado_plan_distributed_task');
+    assert.equal(planDistributedTool.inputSchema.properties.mode.enum.includes('map_reduce'), true);
+    assert.equal(planDistributedTool.inputSchema.properties.subtasks.type, 'array');
+    const runDistributedTool = tools.tools.find((tool) => tool.name === 'nado_run_distributed_task');
+    assert.equal(runDistributedTool.inputSchema.properties.waitTimeoutMs.type, 'number');
+    assert.equal(runDistributedTool.inputSchema.properties.includeReport.type, 'boolean');
     const submitTaskTool = tools.tools.find((tool) => tool.name === 'nado_submit_task');
     assert.equal(submitTaskTool.inputSchema.properties.keepWorkspace.type, 'boolean');
     assert.equal(submitTaskTool.inputSchema.properties.env.type, 'object');
@@ -258,6 +266,21 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
       },
     }));
     assert.equal(dispatchPlan.plan.totalTasks, 2);
+
+    const distributedPlan = jsonFromTool(await mcp.request('tools/call', {
+      name: 'nado_plan_distributed_task',
+      arguments: {
+        title: 'mcp distributed plan',
+        prompt: 'Split this documentation implementation into worker shards and synthesize the final result.',
+        mode: 'map_reduce',
+        subtasks: ['docs: Draft docs', 'checks: Review tests'],
+        capabilities: ['code'],
+        labels: { zone: 'mcp' },
+      },
+    }));
+    assert.equal(distributedPlan.planner.mode, 'map_reduce');
+    assert.equal(distributedPlan.batch.tasks.at(-1).key, 'final_synthesis');
+    assert.equal(distributedPlan.dispatchPlan.totalTasks, 3);
     assert.equal(dispatchPlan.plan.counts.assigned, 1);
     assert.equal(dispatchPlan.plan.counts.unassigned, 1);
     assert.equal(dispatchPlan.plan.items[0].scheduler.workerId, 'mcp-worker');

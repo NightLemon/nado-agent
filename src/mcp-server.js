@@ -449,6 +449,45 @@ const batchSubmitProperties = {
   requireRoutable: { type: 'boolean' },
 };
 
+const distributedPlannerProperties = {
+  title: { type: 'string' },
+  prompt: { type: 'string' },
+  mode: { type: 'string', enum: ['auto', 'parallel', 'pipeline', 'map_reduce', 'review'] },
+  subtasks: {
+    type: 'array',
+    items: {
+      oneOf: [
+        { type: 'string' },
+        {
+          type: 'object',
+          properties: {
+            key: { type: 'string' },
+            title: { type: 'string' },
+            prompt: { type: 'string' },
+            workerId: { type: 'string' },
+            capabilities: { type: 'array', items: { type: 'string' } },
+            tools: { type: 'array', items: { type: 'string' } },
+            labels: { type: 'object', additionalProperties: { type: 'string' } },
+            slots: { type: 'number' },
+          },
+          additionalProperties: false,
+        },
+      ],
+    },
+  },
+  shards: { type: 'number' },
+  type: { type: 'string', enum: ['shell', 'agent'] },
+  workerId: { type: 'string' },
+  capabilities: { type: 'array', items: { type: 'string' } },
+  tools: { type: 'array', items: { type: 'string' } },
+  labels: { type: 'object', additionalProperties: { type: 'string' } },
+  slots: { type: 'number' },
+  priority: { type: 'number' },
+  keepWorkspace: { type: 'boolean' },
+  sandboxProfile: { type: 'string', enum: ['default', 'isolated'] },
+  requireRoutable: { type: 'boolean' },
+};
+
 function mapMcpTaskInput(input = {}) {
   const mapped = { ...input };
   if (input.capabilities !== undefined) {
@@ -827,6 +866,34 @@ const toolSchemas = [
         priority: { type: 'number' },
         keepWorkspace: { type: 'boolean' },
         sandboxProfile: { type: 'string', enum: ['default', 'isolated'] },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nado_plan_distributed_task',
+    description: 'Plan one large user request into a distributed subagent-style batch DAG. Returns batch JSON plus dispatch preview; does not create tasks.',
+    inputSchema: {
+      type: 'object',
+      required: ['prompt'],
+      properties: distributedPlannerProperties,
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nado_run_distributed_task',
+    description: 'Plan one large user request into a distributed batch DAG, submit it, and optionally wait/report artifacts.',
+    inputSchema: {
+      type: 'object',
+      required: ['prompt'],
+      properties: {
+        ...distributedPlannerProperties,
+        waitTimeoutMs: { type: 'number' },
+        includeReport: { type: 'boolean' },
+        includeArtifacts: { type: 'boolean' },
+        includeArtifactContent: { type: 'boolean' },
+        stdoutChars: { type: 'number' },
+        stderrChars: { type: 'number' },
       },
       additionalProperties: false,
     },
@@ -1565,6 +1632,31 @@ async function callTool(client, name, args = {}, config = {}) {
   }
   if (name === 'nado_plan_dispatch') {
     return textResult(await client.planDispatch(args));
+  }
+  if (name === 'nado_plan_distributed_task') {
+    return textResult(await client.planDistributedTask(args));
+  }
+  if (name === 'nado_run_distributed_task') {
+    const created = await client.runDistributedTaskPlan(args);
+    const result = {
+      ...created,
+    };
+    if (args.waitTimeoutMs) {
+      const waited = await waitBatch(client, created.batch.id, args.waitTimeoutMs);
+      result.waited = waited;
+    }
+    if (args.includeReport) {
+      result.report = await client.getBatchReport(created.batch.id, {
+        stdoutChars: args.stdoutChars,
+        stderrChars: args.stderrChars,
+      });
+    }
+    if (args.includeArtifacts) {
+      result.artifacts = args.includeArtifactContent === false
+        ? await client.listBatchArtifacts(created.batch.id)
+        : await client.getBatchArtifacts(created.batch.id);
+    }
+    return textResult(result);
   }
   if (name === 'nado_submit_batch') {
     const created = await client.createBatch(batchCreateRequestFromMcpArgs(args));

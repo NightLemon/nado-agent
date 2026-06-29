@@ -94,6 +94,7 @@ export function buildGatewayCapabilities({ controlUrl, workers = [], sessions = 
       networkActionHints: true,
       trustedProxyHeaders: true,
       dispatchPlanning: true,
+      distributedTaskPlanning: true,
       requireRoutableSubmit: true,
       cliSubmitFlow: true,
       cliBatchSubmitFlow: true,
@@ -212,6 +213,10 @@ export function buildGatewayCapabilities({ controlUrl, workers = [], sessions = 
         artifactsJson: 'GET /api/batches/{batchId}/artifacts/content',
         artifactsZip: 'GET /api/batches/{batchId}/artifacts/download',
       },
+      planner: {
+        plan: 'POST /api/planner/plan',
+        run: 'POST /api/planner/run',
+      },
       dispatch: {
         plan: 'POST /api/dispatch/plan',
       },
@@ -226,6 +231,8 @@ export function buildGatewayCapabilities({ controlUrl, workers = [], sessions = 
         `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js demo health --control ${controlUrl}`,
         `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js verify --control ${controlUrl}`,
         `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js dispatch plan --control ${controlUrl} --file ./batch.json`,
+        `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js planner plan --control ${controlUrl} --prompt "large task" --mode map_reduce --json`,
+        `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js planner run --control ${controlUrl} --prompt "large task" --mode map_reduce --require-routable --wait --report`,
         `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js worker logs --control ${controlUrl} --id <worker-id> --tail 50`,
         `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js worker bootstrap-bundle --control ${controlUrl} --out ./nado-worker-bootstrap.zip`,
         `NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js worker bundle --control ${controlUrl} --id <worker-id> --issue-token --out ./nado-worker.zip`,

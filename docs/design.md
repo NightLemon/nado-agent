@@ -60,6 +60,14 @@ The gateway also owns batches. A batch is a durable group of independent or depe
 - Failed or cancelled child tasks can be retried without recreating the batch or rerunning successful child tasks.
 - Non-terminal child tasks can be cancelled as a batch, using the same task cancellation and worker command path as individual task cancellation.
 
+The gateway also owns a distributed planner above batches. The planner turns one large user request into normal submit-ready batch JSON rather than inventing a separate execution path:
+
+- `parallel` creates independent shard tasks.
+- `pipeline` creates dependent stages where each stage can consume the previous stage's artifacts.
+- `map_reduce` fans out shard tasks, then adds a final synthesis task with `dependencyArtifacts: true`.
+- `review` fans out independent review tasks, then adds a final adjudication task.
+- `auto` chooses one of these deterministic topologies from the prompt/subtask shape while still returning editable batch JSON, so a control-side LLM can refine it before submission.
+
 ## Technical Baseline
 
 The MVP and later versions use the same technical scheme:
@@ -77,13 +85,14 @@ The MVP and later versions use the same technical scheme:
 - Worker label routing: tasks and sessions can require worker labels without bypassing the normal scheduler or claim path.
 - Task priority: queued tasks keep a numeric priority so urgent control-side work can be claimed before older lower-priority work.
 - Batch model: the `Batch` record groups independent or dependency-ordered tasks without creating a separate execution path.
+- Planner model: the distributed planner creates ordinary batch DAGs for large tasks, preserving the same scheduler, dependency, artifact, report, retry, and cancellation behavior as hand-written batch JSON.
 - Scheduler: unassigned tasks are bound by the control server at creation time using the same worker/task/session/capacity state exposed through the API.
 - Input files: tasks can carry bounded control-side files or directories that workers materialize into the task/session workspace before execution.
 - Routability guard: task and batch submissions can ask the gateway to reject work before creation when no online/admin-enabled worker matches static routing constraints.
 - Task env: tasks can carry explicit environment variables for build flags and tool configuration; reserved `NADO_*` values are always supplied by the worker after custom env.
 - Session model: the `Session` record, worker affinity, shared workspace, task history, and close behavior are stable product contracts.
 - CLI and MCP: `src/cli.js` and `src/mcp-server.js` are the primary user and control-agent interfaces, not throwaway demo wrappers.
-- Dashboard: the control server serves a lightweight browser dashboard from the same HTTP API for agent-style Control Console submission with automatic task detail/event streaming, operator inspection, worker detail/inventory/metrics review, AGENTS.md context preview/download, gateway manifest preview/download, MCP client config generation, doctor checks, readiness verification, self-service worker bootstrap bundle download, fixed-ID worker invite and portable worker bundle download/self-test/token management, shell/agent task submission with env/input files/artifact policy/workspace controls/routability guards, scheduler inspection, task event streaming, task management, offline task recovery, session creation/inspection, session task submission, latest session artifact download, batch planning, dispatch preview, batch submission, batch management, batch event timeline inspection/streaming, batch artifact download, and batch report inspection.
+- Dashboard: the control server serves a lightweight browser dashboard from the same HTTP API for agent-style Control Console submission with automatic task detail/event streaming, operator inspection, worker detail/inventory/metrics review, AGENTS.md context preview/download, gateway manifest preview/download, MCP client config generation, doctor checks, readiness verification, self-service worker bootstrap bundle download, fixed-ID worker invite and portable worker bundle download/self-test/token management, shell/agent task submission with env/input files/artifact policy/workspace controls/routability guards, scheduler inspection, task event streaming, task management, offline task recovery, session creation/inspection, session task submission, latest session artifact download, distributed planning, batch planning, dispatch preview, batch submission, batch management, batch event timeline inspection/streaming, batch artifact download, and batch report inspection.
 - Storage: the control server uses a durable store abstraction with the same task/worker/session/batch contract across backends. `JsonStore` remains the local/dev default, while `SQLiteStore` is the production-shaped single-VM backend selected with `NADO_STORE=sqlite`.
 - Execution: shell and configurable terminal-agent task types are the durable worker execution abstraction. Later container or VM sandboxes should wrap this execution layer rather than replace the control protocol.
 - Sandbox profile: `sandboxProfile: "isolated"` runs through the same worker execution path with a minimal inherited host environment, explicit task env, and gateway-managed `NADO_*` variables. This reduces accidental worker environment leakage while leaving stronger OS/container isolation as a wrapper around the execution layer.
@@ -102,6 +111,7 @@ Responsibilities:
 - Store worker metadata, capabilities, durable runtime events, and last-seen timestamps.
 - Accept task submissions.
 - Accept batch submissions and create grouped child tasks.
+- Plan one large request into a distributed batch DAG without bypassing normal scheduling, dependencies, artifacts, retries, or cancellation.
 - Accept session creation and close requests.
 - Route tasks by explicit worker ID, required capabilities, or required worker labels.
 - Schedule unassigned tasks by filtering offline/paused/draining/capability-incompatible/tool-incompatible/label-incompatible/full workers and scoring available capacity, idle state, tools, explicit or inferred capability matches, agent availability, and recent failures.
@@ -129,6 +139,7 @@ Responsibilities:
 - Preview and download a machine-readable gateway capabilities manifest through the same authenticated HTTP API. The manifest includes networking conventions for IPv6/public control URLs and a routing-policy summary so control-side agents can reason about automatic GPU/docs/PPT inference and scheduler explainability before dispatching work.
 - Run readiness verification through the same authenticated `POST /api/verify` path used by HTTP clients and control-side agents.
 - Preview dispatch for editable batch JSON through the same dry-run scheduler API used by CLI and MCP.
+- Plan distributed work from one large prompt, show the generated topology, fill the editable batch JSON, preview dispatch, and optionally submit it as a normal batch.
 - Require static routability on task and batch submissions before mutating gateway state.
 - Download self-service worker bootstrap bundles for hosts that should generate their own identity, then issue worker-specific tokens and generate fixed-ID bash or PowerShell worker invite scripts and portable bundle downloads through the same onboarding contract used by the CLI, HTTP API, and MCP.
 - List and revoke worker-specific tokens through the existing worker-token APIs.
@@ -181,6 +192,7 @@ Responsibilities:
 - Submit shell or agent tasks.
 - Submit a task, wait for terminal status, and download artifacts in one operator flow.
 - Draft submit-ready batch JSON from short subtask lines, then submit it through the same batch API.
+- Plan one large request into `parallel`, `pipeline`, `map_reduce`, or `review` batch DAGs, then preview or submit the resulting batch.
 - Submit tasks with explicit required tools such as `node`, `git`, `gh`, `codex`, `claude`, or `nvidia-smi`.
 - Submit tasks or sessions with worker label requirements.
 - Submit tasks with priority for queue ordering.
@@ -223,6 +235,7 @@ Responsibilities:
 - Let agents issue invite scripts that embed a revocable worker token rather than the shared admin token.
 - Let agents list and revoke worker-specific tokens.
 - Let agents submit and inspect durable task batches.
+- Let agents plan one large request into a distributed batch DAG and either inspect the generated plan or submit it as a normal batch.
 - Let agents submit a batch, wait for terminal aggregate status, inspect a consolidated report, and retrieve grouped artifact content in one tool call when multi-task handoff should be synchronous from the agent's perspective.
 - Let agents wait for batch completion and list all child task artifact metadata.
 - Let agents inspect a merged batch event timeline across batch and child task events.

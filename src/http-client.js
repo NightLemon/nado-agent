@@ -421,6 +421,14 @@ export class NadoClient {
     return this.request('POST', '/api/dispatch/plan', options);
   }
 
+  planDistributedTask(options) {
+    return this.request('POST', '/api/planner/plan', options);
+  }
+
+  runDistributedTaskPlan(options) {
+    return this.request('POST', '/api/planner/run', options);
+  }
+
   createSession(session) {
     return this.request('POST', '/api/sessions', session);
   }

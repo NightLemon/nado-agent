@@ -11,6 +11,7 @@ import { NadoClient } from './http-client.js';
 import { buildMcpClientConfig, formatMcpCommand } from './mcp-config.js';
 import { buildWorkerBootstrapBundle, buildWorkerBundle } from './worker-bundle.js';
 import { buildBatchPlan } from './batch-plan.js';
+import { buildDistributedTaskPlan } from './task-planner.js';
 import { buildDispatchPlan } from './dispatch-plan.js';
 import { controlUrlFromHostPort, ensureDir, normalizeBaseUrl, originFromHostHeader, safeName } from './utils.js';
 import { buildZipArchive, safeZipPath } from './zip.js';
@@ -997,6 +998,53 @@ export async function createControlServer(options) {
         assertAdmin(principal);
         const body = await readBody(request);
         sendJson(response, 200, { batch: buildBatchPlan(body) });
+        return;
+      }
+
+      if (request.method === 'POST' && parts.join('/') === 'api/planner/plan') {
+        assertAdmin(principal);
+        const body = await readBody(request);
+        const planned = buildDistributedTaskPlan(body, {
+          workers: store.listWorkers(),
+          tasks: store.listTasks(),
+          sessions: store.listSessions(),
+        });
+        const dispatchPlan = buildDispatchPlan(planned.batch, {
+          workers: store.listWorkers(),
+          tasks: store.listTasks(),
+          sessions: store.listSessions(),
+        });
+        sendJson(response, 200, {
+          ...planned,
+          dispatchPlan,
+        });
+        return;
+      }
+
+      if (request.method === 'POST' && parts.join('/') === 'api/planner/run') {
+        assertAdmin(principal);
+        const body = await readBody(request);
+        const planned = buildDistributedTaskPlan(body, {
+          workers: store.listWorkers(),
+          tasks: store.listTasks(),
+          sessions: store.listSessions(),
+        });
+        const batchSpec = {
+          ...planned.batch,
+          requireRoutable: Boolean(body.requireRoutable),
+        };
+        const created = await store.createBatch(batchSpec);
+        sendJson(response, 201, {
+          ...planned,
+          ...created,
+          routing: created.tasks.map((task) => ({
+            taskId: task.id,
+            key: task.batchKey,
+            workerId: task.scheduler?.workerId || task.requestedWorkerId || null,
+            reason: task.scheduler?.reason || null,
+            candidates: task.scheduler?.candidates || [],
+          })),
+        });
         return;
       }
 

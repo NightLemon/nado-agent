@@ -36,6 +36,8 @@ Control URL: http://127.0.0.1:59610
 - `nado_list_tasks`
 - `nado_prune_system_history`
 - `nado_plan_batch`
+- `nado_plan_distributed_task`
+- `nado_run_distributed_task`
 - `nado_submit_batch`
 - `nado_run_batch`
 - `nado_plan_dispatch`
@@ -254,6 +256,8 @@ Use `--cleanup-workspace` for one-off non-session tasks when worker-local files 
 Submit a batch of subtasks. In the JSON file, use task `key` and `dependsOn` when later work must wait for earlier work:
 
 ```bash
+NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js planner plan --control http://127.0.0.1:59610 --prompt "large task to split across workers" --mode map_reduce --json
+NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js planner run --control http://127.0.0.1:59610 --prompt "large task to split across workers" --mode map_reduce --require-routable --wait --report
 node ./src/cli.js batch plan --title "implementation shards" --type agent --capability code --task "docs: Draft docs" --task "tests: Add smoke tests" --out ./batch.json
 NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js batch submit --control http://127.0.0.1:59610 --file ./batch.json
 NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js dispatch plan --control http://127.0.0.1:59610 --file ./batch.json
@@ -345,7 +349,10 @@ NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js mcp config --control http://127.0.0.1
 - Use `history prune-system --dry-run` or MCP `nado_prune_system_history` after repeated verify/doctor runs when diagnostic history starts burying user work; it preserves user tasks, user batches, and sessions.
 - Use `mcp config --format json` to connect this gateway to any MCP client that accepts a stdio `mcpServers` config.
 - Use sessions for multi-step subprojects so one worker keeps the same workspace and context across tasks.
-- Use `batch plan`, MCP `nado_plan_batch`, HTTP `POST /api/batches/plan`, or Dashboard Plan Batch to draft ordinary batch JSON from short subtask lines before submitting parallel work.
+- Use `planner plan`, MCP `nado_plan_distributed_task`, HTTP `POST /api/planner/plan`, or Dashboard Distributed Planner when the user gives one large task and wants Nado to create a subagent-style batch DAG.
+- Use `planner run`, MCP `nado_run_distributed_task`, HTTP `POST /api/planner/run`, or Dashboard Run Distributed Plan to create the plan and submit it as a normal durable batch.
+- Planner modes are `auto`, `parallel`, `pipeline`, `map_reduce`, and `review`. `map_reduce` and `review` add a final dependent synthesis/adjudication task with `dependencyArtifacts: true`; shard tasks write `result.md` or `review.md`, and final tasks write `final.md`.
+- Use `batch plan`, MCP `nado_plan_batch`, HTTP `POST /api/batches/plan`, or Dashboard Plan Batch to draft ordinary batch JSON from explicit short subtask lines before submitting parallel work.
 - Use `dispatch plan`, MCP `nado_plan_dispatch`, HTTP `POST /api/dispatch/plan`, or Dashboard Preview Dispatch to see worker assignment, candidate scores, capacity conflicts, and `nextAction` hints before creating tasks.
 - Use `--require-routable` or submission field `requireRoutable: true` when task or batch creation should fail fast if no online worker matches static routing constraints; rejection errors include `nextAction=<code>` and HTTP/MCP callers can inspect the attached dispatch plan.
 - In the Dashboard, `requireRoutable` task or batch submission errors render the attached dispatch plan so the operator can see routability, inferred/effective capabilities, candidate workers, and next actions without creating stuck tasks.

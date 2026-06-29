@@ -831,3 +831,19 @@ Acceptance:
 - MCP `nado_submit_batch` and `nado_run_batch` return `routing[]` summaries for each child task, including selected worker, scheduler reason, inferred capabilities, inference evidence, candidates, and rejected candidate reasons; `nado_run_batch` also returns `finalRouting[]`.
 - By default, `nado_run_batch` returns the same consolidated report shape as `nado_batch_report` and grouped base64 artifact content through the same API as `nado_get_batch_artifacts`; callers can disable report/artifact content.
 - Automated tests verify tool discovery, schema fields, successful run-to-completion, report content, and grouped artifact content against a live control server and worker.
+
+## A64: Distributed Planner Turns One Large Task Into A Batch DAG
+
+Acceptance:
+
+- `POST /api/planner/plan` accepts one large `prompt`, optional `subtasks`, and mode `auto`, `parallel`, `pipeline`, `map_reduce`, or `review`.
+- The planner returns a normal submit-ready batch JSON object plus a dispatch preview using the same scheduler as `POST /api/dispatch/plan`.
+- `map_reduce` creates shard tasks plus a final synthesis task with `dependsOn` all shards and `dependencyArtifacts: true`.
+- `review` creates independent review tasks plus a final adjudication task with `dependsOn` all reviews and `dependencyArtifacts: true`.
+- `pipeline` creates a dependency chain where each later stage depends on the previous stage and receives dependency artifacts.
+- `POST /api/planner/run` creates the planned work as a normal durable batch through the existing batch creation path.
+- CLI exposes `nado planner plan` and `nado planner run`.
+- MCP exposes `nado_plan_distributed_task` and `nado_run_distributed_task`.
+- Dashboard exposes Distributed Planner controls that can plan into editable batch JSON or submit the generated batch directly.
+- Capabilities manifest advertises distributed task planning and planner endpoints.
+- Automated tests verify planner topology, HTTP plan/run behavior, dispatch preview, and normal batch creation semantics.

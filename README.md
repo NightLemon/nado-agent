@@ -361,6 +361,32 @@ NADO_TOKEN=dev-token node ./src/cli.js submit \
   --command "npm test || true"
 ```
 
+Plan one large request into a distributed subagent-style batch. `map_reduce` fans out shard tasks and adds a final synthesis task that consumes shard artifacts; `review` does the same for independent reviews; `pipeline` creates dependent stages; `parallel` creates independent shards only:
+
+```bash
+NADO_TOKEN=dev-token node ./src/cli.js planner plan \
+  --control http://127.0.0.1:8765 \
+  --title "azure deployment research" \
+  --prompt "Research and prepare a production Azure VM deployment plan for this project." \
+  --mode map_reduce \
+  --subtask "infra: Azure VM/network/security design" \
+  --subtask "ops: deployment commands and rollback" \
+  --subtask "docs: final operator-facing guide" \
+  --out ./planned-batch.json
+```
+
+```bash
+NADO_TOKEN=dev-token node ./src/cli.js planner run \
+  --control http://127.0.0.1:8765 \
+  --prompt "Research and prepare a production Azure VM deployment plan for this project." \
+  --mode map_reduce \
+  --require-routable \
+  --wait \
+  --report
+```
+
+The planner returns ordinary batch JSON, so the scheduler, worker routing, dependency blocking, artifact upload, batch report, retry, cancel, and download flows remain exactly the same as hand-written batches. Use MCP `nado_plan_distributed_task` or `nado_run_distributed_task`, HTTP `POST /api/planner/plan` or `POST /api/planner/run`, or the Dashboard Distributed Planner for the same capability from a control-side agent.
+
 Submit a batch of subtasks from one JSON file. Add `key` and `dependsOn` when one task must wait for another:
 
 ```bash

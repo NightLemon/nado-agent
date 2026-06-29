@@ -1240,6 +1240,57 @@ export function dashboardHtml(options = {}) {
           </form>
         </section>
         <section>
+          <h2>Distributed Planner</h2>
+          <form id="plannerForm" class="form-grid">
+            <div class="wide">
+              <label for="plannerTitle">Title</label>
+              <input id="plannerTitle" name="title" placeholder="large task">
+            </div>
+            <div>
+              <label for="plannerMode">Mode</label>
+              <select id="plannerMode" name="mode">
+                <option value="auto">auto</option>
+                <option value="map_reduce">map_reduce</option>
+                <option value="parallel">parallel</option>
+                <option value="pipeline">pipeline</option>
+                <option value="review">review</option>
+              </select>
+            </div>
+            <div>
+              <label for="plannerShards">Shards</label>
+              <input id="plannerShards" name="shards" type="number" min="1" max="16" placeholder="auto">
+            </div>
+            <div>
+              <label for="plannerCapability">Capability</label>
+              <input id="plannerCapability" name="capability" placeholder="code,docs,gpu">
+            </div>
+            <div>
+              <label for="plannerTool">Required tool</label>
+              <input id="plannerTool" name="tool" placeholder="codex,claude">
+            </div>
+            <div>
+              <label for="plannerLabel">Required label</label>
+              <input id="plannerLabel" name="label" placeholder="zone=lab">
+            </div>
+            <div class="wide">
+              <label for="plannerPrompt">Large task</label>
+              <textarea id="plannerPrompt" name="prompt" placeholder="Describe the task to split across workers"></textarea>
+            </div>
+            <div class="wide">
+              <label for="plannerSubtasks">Optional focus areas</label>
+              <textarea id="plannerSubtasks" name="subtasks" placeholder="research: collect facts&#10;implementation: make changes&#10;verify: run tests"></textarea>
+            </div>
+            <div class="wide">
+              <label><input id="plannerRequireRoutable" name="requireRoutable" type="checkbox"> Require routable workers</label>
+            </div>
+            <div class="wide actions">
+              <button id="planDistributedTask" class="primary" type="submit">Plan Distributed Task</button>
+              <button id="runDistributedPlan" type="button">Run Distributed Plan</button>
+            </div>
+          </form>
+          <div id="plannerResult" class="empty">No distributed plan loaded</div>
+        </section>
+        <section>
           <h2>Plan Batch</h2>
           <form id="batchPlanForm" class="form-grid">
             <div class="wide">
@@ -1664,6 +1715,19 @@ export function dashboardHtml(options = {}) {
         'Require routable workers': '要求可路由工作端',
         'Submit': '提交',
         'Require routable worker': '要求可路由工作端',
+        'Distributed Planner': '分布式规划器',
+        'Mode': '模式',
+        'Shards': '分片',
+        'Strategy': '策略',
+        'Depends On': '依赖',
+        'Assumptions': '假设',
+        'Large task': '大任务',
+        'Optional focus areas': '可选关注点',
+        'Describe the task to split across workers': '描述要拆分到多个工作端的大任务',
+        'Plan Distributed Task': '规划分布式任务',
+        'Run Distributed Plan': '运行分布式计划',
+        'No distributed plan loaded': '尚未加载分布式计划',
+        'Distributed planner requires a large task prompt': '分布式规划器需要填写大任务描述',
         'Plan Batch': '规划批次',
         'Batch JSON': '批次 JSON',
         'Submit Batch JSON': '提交批次 JSON',
@@ -3266,6 +3330,28 @@ export function dashboardHtml(options = {}) {
           { label: 'Candidates', value: (item) => esc((item.scheduler?.candidates || []).map((candidate) => candidate.workerId + ':' + (candidate.eligible ? candidate.score : 'no')).join(', ') || '-') },
           { label: 'Title', value: (item) => esc(item.title || '-') },
         ], plan.items || []);
+    }
+
+    function renderPlannerResult(result) {
+      const planner = result.planner || {};
+      const target = document.getElementById('plannerResult');
+      target.innerHTML = ''
+        + '<div class="detail-grid">'
+        + '<div class="detail-item"><span>Mode</span><div>' + esc(planner.mode || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Tasks</span><div>' + esc(planner.taskCount || 0) + '</div></div>'
+        + '<div class="detail-item"><span>Shards</span><div>' + esc(planner.shardCount || 0) + '</div></div>'
+        + '<div class="detail-item"><span>Strategy</span><div>' + esc(planner.strategy || '-') + '</div></div>'
+        + '</div>'
+        + table([
+          { label: 'Key', value: (item) => '<span class="mono">' + esc(item.key) + '</span>' },
+          { label: 'Depends On', value: (item) => esc((item.dependsOn || []).join(',') || '-') },
+          { label: 'Title', value: (item) => esc(item.title || '-') },
+        ], planner.topology || [])
+        + '<div class="subhead">' + esc(localizeText('Assumptions')) + '</div>'
+        + '<pre>' + esc((planner.assumptions || []).join('\\n')) + '</pre>';
+      if (result.dispatchPlan) {
+        renderDispatchPlan(result.dispatchPlan);
+      }
     }
 
     function showDispatchPlanError(error) {
@@ -5116,7 +5202,7 @@ export function dashboardHtml(options = {}) {
       if (has('#tasks')) return ['workbench', 'tasks'];
       if (has('#inviteForm') || has('#workerTokens')) return ['onboarding'];
       if (has('#submitForm')) return ['tasks'];
-      if (has('#batchPlanForm') || has('#batchForm') || has('#batches') || has('#batchDetail')) return ['batches'];
+      if (has('#plannerForm') || has('#batchPlanForm') || has('#batchForm') || has('#batches') || has('#batchDetail')) return ['batches'];
       if (has('#sessionForm') || has('#sessions') || has('#sessionDetail')) return ['sessions'];
       if (has('#doctorForm') || has('#verifyForm') || has('#agentContext') || has('#capabilitiesManifest') || has('#mcpConfig') || has('#recoveryForm')) return ['ops'];
       return ['ops'];
@@ -5222,6 +5308,25 @@ export function dashboardHtml(options = {}) {
 
     function parsePlanTasks(value) {
       return String(value || '').split(/\\n/).map((item) => item.trim()).filter(Boolean);
+    }
+
+    function plannerFormBody() {
+      const form = new FormData(document.getElementById('plannerForm'));
+      const body = {
+        title: form.get('title') || undefined,
+        prompt: form.get('prompt') || '',
+        mode: form.get('mode') || 'auto',
+        shards: form.get('shards') ? Number(form.get('shards')) : undefined,
+        subtasks: parsePlanTasks(form.get('subtasks')),
+        capabilities: parseCsv(form.get('capability')),
+        tools: parseCsv(form.get('tool')),
+        labels: parseLabel(form.get('label')),
+        requireRoutable: Boolean(form.get('requireRoutable')),
+      };
+      if (!body.subtasks.length) {
+        delete body.subtasks;
+      }
+      return body;
     }
 
     function bytesToBase64(bytes) {
@@ -5973,6 +6078,49 @@ export function dashboardHtml(options = {}) {
         });
         document.getElementById('batchJson').value = JSON.stringify(result.batch, null, 2);
         setStatus('Planned ' + result.batch.tasks.length + ' batch task(s)');
+      } catch (error) {
+        if (!showDispatchPlanError(error)) {
+          setStatus(error.message, true);
+        }
+      }
+    });
+    document.getElementById('plannerForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const body = plannerFormBody();
+      if (!body.prompt.trim()) {
+        setStatus('Distributed planner requires a large task prompt', true);
+        return;
+      }
+      try {
+        const result = await api('/api/planner/plan', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        renderPlannerResult(result);
+        document.getElementById('batchJson').value = JSON.stringify(result.batch, null, 2);
+        setStatus('Planned distributed batch with ' + result.planner.taskCount + ' task(s)');
+      } catch (error) {
+        if (!showDispatchPlanError(error)) {
+          setStatus(error.message, true);
+        }
+      }
+    });
+    document.getElementById('runDistributedPlan').addEventListener('click', async () => {
+      const body = plannerFormBody();
+      if (!body.prompt.trim()) {
+        setStatus('Distributed planner requires a large task prompt', true);
+        return;
+      }
+      try {
+        const result = await api('/api/planner/run', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        renderPlannerResult(result);
+        state.selectedBatchId = result.batch.id;
+        state.selectedBatchMode = 'detail';
+        setStatus('Submitted distributed batch ' + result.batch.id);
+        await refresh();
       } catch (error) {
         if (!showDispatchPlanError(error)) {
           setStatus(error.message, true);

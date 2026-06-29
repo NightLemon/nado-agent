@@ -141,6 +141,11 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /MCP Config/);
     assert.match(html, /Offline Recovery/);
     assert.match(html, /Submit Task/);
+    assert.match(html, /Distributed Planner/);
+    assert.match(html, /plannerForm/);
+    assert.match(html, /Plan Distributed Task/);
+    assert.match(html, /Run Distributed Plan/);
+    assert.match(html, /has\('#plannerForm'\).*return \['batches'\]/);
     assert.match(html, /Plan Batch/);
     assert.match(html, /Submit Batch JSON/);
     assert.match(html, /Create Session/);
@@ -209,6 +214,8 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /最终必需能力/);
     assert.match(html, /\/api\/batches/);
     assert.match(html, /\/api\/batches\/plan/);
+    assert.match(html, /\/api\/planner\/plan/);
+    assert.match(html, /\/api\/planner\/run/);
     assert.match(html, /\/api\/dispatch\/plan/);
     assert.match(html, /showDispatchPlanError/);
     assert.match(html, /Routing blocked; dispatch plan shown/);
@@ -416,6 +423,10 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(deniedDemoHealth.status, 401);
     const deniedDispatchPlan = await fetch(`${controlUrl}/api/dispatch/plan`, { method: 'POST' });
     assert.equal(deniedDispatchPlan.status, 401);
+    const deniedPlannerPlan = await fetch(`${controlUrl}/api/planner/plan`, { method: 'POST' });
+    assert.equal(deniedPlannerPlan.status, 401);
+    const deniedPlannerRun = await fetch(`${controlUrl}/api/planner/run`, { method: 'POST' });
+    assert.equal(deniedPlannerRun.status, 401);
 
     const client = new NadoClient({ controlUrl, token });
     const status = await client.status();
@@ -445,6 +456,7 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(capabilities.features.cliBatchSubmitFlow, true);
     assert.equal(capabilities.features.mcpRunTaskFlow, true);
     assert.equal(capabilities.features.mcpRunBatchFlow, true);
+    assert.equal(capabilities.features.distributedTaskPlanning, true);
     assert.equal(capabilities.features.ipv6ControlUrls, true);
     assert.equal(capabilities.features.networkActionHints, true);
     assert.equal(capabilities.features.trustedProxyHeaders, true);
@@ -491,6 +503,8 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(capabilities.endpoints.demoHealth, 'POST /api/demo/health');
     assert.equal(capabilities.endpoints.network, 'GET /api/network');
     assert.equal(capabilities.endpoints.dispatch.plan, 'POST /api/dispatch/plan');
+    assert.equal(capabilities.endpoints.planner.plan, 'POST /api/planner/plan');
+    assert.equal(capabilities.endpoints.planner.run, 'POST /api/planner/run');
     assert.equal(capabilities.workers.length, 0);
     const network = await client.networkInfo();
     assert.equal(network.requestUrl, controlUrl);
@@ -510,6 +524,8 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(context, /`nado_capabilities`/);
     assert.match(context, /`nado_demo_health`/);
     assert.match(context, /`nado_run_task`/);
+    assert.match(context, /`nado_plan_distributed_task`/);
+    assert.match(context, /planner run/);
     const mcpConfig = await client.mcpConfig({ name: 'nado-test' });
     assert.equal(mcpConfig.mcpServers['nado-test'].env.NADO_TOKEN, token);
     assert.ok(mcpConfig.mcpServers['nado-test'].args.includes(controlUrl));

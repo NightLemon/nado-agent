@@ -57,6 +57,8 @@ Usage:
   nado session download SESSION_ID --out ./downloads --control URL
   nado submit --control URL (--command CMD | --prompt PROMPT) [--worker ID] [--capability gpu] [--tool codex] [--required-label zone=lab] [--env KEY=value] [--sandbox|--sandbox-profile isolated] [--artifact dist/**] [--exclude-artifact tmp/**] [--dependency-artifacts] [--slots 2] [--priority 10] [--session SESSION_ID] [--file ./input.md] [--dir ./project] [--cleanup-workspace] [--keep-workspace] [--require-routable] [--wait] [--watch] [--download --out ./downloads] [--wait-timeout 60000] [--type shell|agent]
   nado batch plan --title TITLE (--task "key: task" | --tasks-file ./tasks.txt) [--type agent|shell] [--command-template CMD] [--worker ID] [--capability code] [--tool node] [--required-label zone=lab] [--out ./batch.json]
+  nado planner plan --control URL (--prompt PROMPT | --prompt-file ./brief.md) [--mode auto|parallel|pipeline|map_reduce|review] [--subtask "key: focus"] [--shards 4] [--out ./batch.json] [--json]
+  nado planner run --control URL (--prompt PROMPT | --prompt-file ./brief.md) [--mode auto|parallel|pipeline|map_reduce|review] [--subtask "key: focus"] [--require-routable] [--wait] [--report] [--download --out ./downloads]
   nado dispatch plan --control URL (--file ./batch.json | --task "key: task") [--type agent|shell] [--command-template CMD] [--worker ID] [--capability code] [--tool node] [--required-label zone=lab] [--json]
   nado batch submit --control URL --file ./batch.json [--require-routable] [--wait] [--report] [--download --out ./downloads] [--timeout 60000]
   nado batches --control URL
@@ -1407,6 +1409,90 @@ async function commandBatchPlan(args) {
   console.log(text.trimEnd());
 }
 
+async function plannerRequestFromArgs(args) {
+  const prompt = args['prompt-file']
+    ? await fs.readFile(path.resolve(args['prompt-file']), 'utf8')
+    : args.prompt;
+  const request = {
+    title: args.title || undefined,
+    prompt: requireValue(prompt, 'Planner requires --prompt or --prompt-file'),
+    mode: args.mode || 'auto',
+    subtasks: valueList(args.subtask || args.subtasks || args.task || args.tasks),
+    shards: args.shards || args['shard-count'],
+    type: args.type || 'agent',
+    workerId: args.worker,
+    capabilities: valueList(args.capability || args.capabilities),
+    tools: parseTools(args.tool || args.tools || args['required-tool'] || args['required-tools']),
+    labels: parseLabels(args['required-label'] || args['required-labels'] || args.label),
+    slots: args.slots || args['task-slots'],
+    priority: args.priority,
+    keepWorkspace: args['cleanup-workspace'] ? false : args['keep-workspace'] ? true : undefined,
+    sandboxProfile: sandboxProfileFromArgs(args),
+    requireRoutable: Boolean(args['require-routable'] || args.requireRoutable),
+  };
+  if (!request.subtasks.length) {
+    delete request.subtasks;
+  }
+  return request;
+}
+
+async function commandPlannerPlan(args) {
+  const client = makeClient(args);
+  const result = await client.planDistributedTask(await plannerRequestFromArgs(args));
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    console.log(`planner=${result.planner.mode}`);
+    console.log(`strategy=${result.planner.strategy}`);
+    console.log(`tasks=${result.planner.taskCount} shards=${result.planner.shardCount}`);
+    console.log(`dispatch assigned=${result.dispatchPlan.counts.assigned} unassigned=${result.dispatchPlan.counts.unassigned}`);
+    for (const item of result.dispatchPlan.items) {
+      console.log(`- ${item.key}: worker=${item.scheduler.workerId || '-'} reason=${item.scheduler.reason} title=${item.title}`);
+    }
+  }
+  if (args.out) {
+    const out = path.resolve(args.out);
+    await fs.mkdir(path.dirname(out), { recursive: true });
+    await fs.writeFile(out, `${JSON.stringify(result.batch, null, 2)}\n`, 'utf8');
+    console.log(`wrote ${out}`);
+  }
+}
+
+async function commandPlannerRun(args) {
+  const client = makeClient(args);
+  const result = await client.runDistributedTaskPlan(await plannerRequestFromArgs(args));
+  console.log(`planner=${result.planner.mode}`);
+  console.log(`batch=${result.batch.id}`);
+  console.log(`title=${result.batch.title}`);
+  console.log(`tasks=${result.tasks.length}`);
+  for (const task of result.tasks) {
+    console.log(`- ${task.id} status=${task.status} key=${task.batchKey || '-'} dependsOn=${task.dependencyKeys?.join(',') || '-'} requestedWorker=${task.requestedWorkerId || '-'} title=${task.title}`);
+    printBatchTaskSchedulerSummary(task);
+  }
+  const shouldWait = Boolean(args.wait || args.report || args.download);
+  let finalBatch = result.batch;
+  if (shouldWait) {
+    finalBatch = await waitForBatchTerminal(client, result.batch.id, Number(args.timeout || 60_000));
+    console.log(`waitStatus=${finalBatch.status}`);
+    console.log(`completed=${finalBatch.completedTasks}/${finalBatch.totalTasks}`);
+  }
+  if (args.report) {
+    const report = await client.getBatchReport(result.batch.id, {
+      stdoutChars: Number(args['stdout-chars'] || 1_200),
+      stderrChars: Number(args['stderr-chars'] || 1_200),
+    });
+    console.log('');
+    console.log(formatBatchReport(report));
+  }
+  if (args.download) {
+    const downloaded = await downloadBatchArtifacts(client, result.batch.id, args.out || '.');
+    console.log(`downloaded ${downloaded.count} batch artifacts from ${downloaded.taskCount}/${downloaded.batch.totalTasks} tasks -> ${downloaded.outRoot}`);
+  }
+  if (shouldWait && finalBatch.status !== 'succeeded') {
+    process.exitCode = 1;
+  }
+}
+
 async function commandDispatchPlan(args) {
   const client = makeClient(args);
   let spec;
@@ -2493,6 +2579,14 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (command === 'batch' && subcommand === 'plan') {
     await commandBatchPlan(args);
+    return;
+  }
+  if (command === 'planner' && subcommand === 'plan') {
+    await commandPlannerPlan(args);
+    return;
+  }
+  if (command === 'planner' && subcommand === 'run') {
+    await commandPlannerRun(args);
     return;
   }
   if (command === 'dispatch' && subcommand === 'plan') {
