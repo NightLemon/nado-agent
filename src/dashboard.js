@@ -1278,7 +1278,7 @@ export function dashboardHtml(options = {}) {
             </div>
             <div class="wide">
               <label for="plannerSubtasks">Optional focus areas</label>
-              <textarea id="plannerSubtasks" name="subtasks" placeholder="research: collect facts&#10;implementation: make changes&#10;verify: run tests"></textarea>
+              <textarea id="plannerSubtasks" name="subtasks" placeholder="part_a@docker-report-a: write upper half&#10;part_b@docker-report-b: write lower half&#10;verify: run tests"></textarea>
             </div>
             <div class="wide">
               <label><input id="plannerRequireRoutable" name="requireRoutable" type="checkbox"> Require routable workers</label>
@@ -1723,6 +1723,7 @@ export function dashboardHtml(options = {}) {
         'Assumptions': '假设',
         'Large task': '大任务',
         'Optional focus areas': '可选关注点',
+        'part_a@docker-report-a: write upper half\\npart_b@docker-report-b: write lower half\\nverify: run tests': 'part_a@docker-report-a: 写上半部分\\npart_b@docker-report-b: 写下半部分\\nverify: 验证测试',
         'Describe the task to split across workers': '描述要拆分到多个工作端的大任务',
         'Plan Distributed Task': '规划分布式任务',
         'Run Distributed Plan': '运行分布式计划',
@@ -5307,7 +5308,24 @@ export function dashboardHtml(options = {}) {
     }
 
     function parsePlanTasks(value) {
-      return String(value || '').split(/\\n/).map((item) => item.trim()).filter(Boolean);
+      return String(value || '').split(/\\n/).map((item) => item.trim()).filter(Boolean).map((item) => {
+        const colon = item.indexOf(':');
+        if (colon <= 0) {
+          return item;
+        }
+        const keyPart = item.slice(0, colon).trim();
+        const prompt = item.slice(colon + 1).trim();
+        const workerSeparator = keyPart.indexOf('@');
+        if (workerSeparator <= 0 || workerSeparator === keyPart.length - 1) {
+          return item;
+        }
+        return {
+          key: keyPart.slice(0, workerSeparator).trim(),
+          workerId: keyPart.slice(workerSeparator + 1).trim(),
+          title: prompt || keyPart,
+          prompt: prompt || keyPart,
+        };
+      });
     }
 
     function plannerFormBody() {

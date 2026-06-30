@@ -3,6 +3,7 @@ param(
   [string]$Token = "split-demo-token",
   [string]$Image = "nado-agent:local",
   [switch]$Build,
+  [switch]$NoSubmit,
   [switch]$StopAfter
 )
 
@@ -198,6 +199,21 @@ $status.workers.items |
   Where-Object { $_.id -in @("docker-report-a", "docker-report-b") } |
   Select-Object id, observedState, capabilities, lastSeenAt |
   Format-Table -AutoSize
+
+if ($NoSubmit) {
+  Write-Host ""
+  Write-Host "Dashboard: $baseUrl/dashboard"
+  Write-Host "Token:     $Token"
+  Write-Host ""
+  Write-Host "Use the Dashboard Batches tab and Distributed Planner with:"
+  Write-Host "  Mode: map_reduce"
+  Write-Host "  Capability: docs"
+  Write-Host "  Focus areas:"
+  Write-Host "    part_a@docker-report-a: Write the upper half: background, goals, and architecture overview"
+  Write-Host "    part_b@docker-report-b: Write the lower half: execution plan, risks, and acceptance criteria"
+  Info "left control and workers running for frontend testing"
+  return
+}
 
 $headers = @{
   Authorization = "Bearer $Token"

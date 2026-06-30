@@ -143,6 +143,8 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /Submit Task/);
     assert.match(html, /Distributed Planner/);
     assert.match(html, /plannerForm/);
+    assert.match(html, /part_a@docker-report-a/);
+    assert.match(html, /workerSeparator = keyPart\.indexOf\('@'\)/);
     assert.match(html, /Plan Distributed Task/);
     assert.match(html, /Run Distributed Plan/);
     assert.match(html, /has\('#plannerForm'\).*return \['batches'\]/);
