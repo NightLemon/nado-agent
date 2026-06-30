@@ -4161,7 +4161,7 @@ export function dashboardHtml(options = {}) {
       state.selectedBatchId = created.batch.id;
       state.selectedBatchMode = 'detail';
       state.activeView = 'batches';
-      savePreference('nadoDashboardView', state.activeView);
+      localStorage.setItem('nadoDashboardView', state.activeView);
       applyView();
       renderConsoleBatchOutput(created.batch, created.tasks || []);
       setStatus('Distributed run submitted ' + created.batch.id);
