@@ -825,6 +825,7 @@ export function dashboardHtml(options = {}) {
         </details>
         <div class="wide actions">
           <button id="runConsoleTask" class="primary" type="submit">Run</button>
+          <button id="runConsoleDistributed" type="button">Run Distributed</button>
           <button id="previewConsoleDispatch" type="button">Preview Route</button>
           <button id="checkConsoleRoutes" type="button">Check Routes</button>
           <button id="newConsoleSession" type="button">New Session</button>
@@ -1529,6 +1530,10 @@ export function dashboardHtml(options = {}) {
         'Routing Options': '路由选项',
         'automatic': '自动路由',
         'Run': '运行',
+        'Run Distributed': '分布式运行',
+        'Distributed console prompt is required': '分布式运行需要填写提示词',
+        'Distributed run submitted ': '已提交分布式运行 ',
+        'Distributed run completed ': '分布式运行完成 ',
         'Preview Route': '预览路由',
         'Check Routes': '检查路由',
         'New Session': '新建会话',
@@ -3886,6 +3891,31 @@ export function dashboardHtml(options = {}) {
       };
     }
 
+    function consoleDistributedRequestFromForm(form) {
+      const prompt = String(form.get('prompt') || '').trim();
+      const title = String(form.get('title') || prompt.slice(0, 80) || 'distributed console task').trim();
+      return {
+        title,
+        prompt,
+        mode: 'auto',
+        type: 'agent',
+        capabilities: parseCsv(form.get('capability')),
+        tools: parseCsv(form.get('tool')),
+        labels: parseLabel(form.get('label')),
+        sessionId: form.get('sessionId') || undefined,
+        priority: form.get('priority') ? Number(form.get('priority')) : undefined,
+        requireRoutable: Boolean(form.get('requireRoutable')),
+      };
+    }
+
+    function terminalBatchStatus(status) {
+      return ['succeeded', 'completed_with_errors', 'cancelled'].includes(status);
+    }
+
+    function delay(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
     function updateConsoleRoutingSummary() {
       const target = document.getElementById('consoleRoutingSummary');
       if (!target) {
@@ -4104,11 +4134,66 @@ export function dashboardHtml(options = {}) {
       setStatus('Console completed ' + taskId + ': ' + task.status, task.status !== 'succeeded');
     }
 
+    function renderConsoleBatchOutput(batch, tasks = []) {
+      const target = document.getElementById('consoleOutput');
+      const lines = [
+        'batch=' + batch.id,
+        'status=' + batch.status + ' completed=' + (batch.completedTasks || 0) + '/' + (batch.totalTasks || tasks.length),
+      ];
+      for (const task of tasks) {
+        lines.push('- ' + (task.batchKey || task.id) + ' status=' + task.status + ' worker=' + (task.assignedWorkerId || task.requestedWorkerId || '-'));
+      }
+      target.textContent = lines.join('\\n');
+      target.scrollTop = target.scrollHeight;
+    }
+
+    async function runConsoleDistributed(form) {
+      const body = consoleDistributedRequestFromForm(form);
+      if (!body.prompt) {
+        setStatus('Distributed console prompt is required', true);
+        return;
+      }
+      clearConsoleResultState();
+      const created = await api('/api/planner/run', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      state.selectedBatchId = created.batch.id;
+      state.selectedBatchMode = 'detail';
+      state.activeView = 'batches';
+      savePreference('nadoDashboardView', state.activeView);
+      applyView();
+      renderConsoleBatchOutput(created.batch, created.tasks || []);
+      setStatus('Distributed run submitted ' + created.batch.id);
+      await refresh();
+      await loadBatchDetail(created.batch.id, 'detail');
+
+      let current = created;
+      for (let attempt = 0; attempt < 75 && !terminalBatchStatus(current.batch.status); attempt += 1) {
+        await delay(800);
+        current = await api('/api/batches/' + encodeURIComponent(created.batch.id));
+        renderConsoleBatchOutput(current.batch, current.tasks || []);
+        await loadBatchDetail(created.batch.id, 'detail');
+      }
+      await refresh();
+      setStatus('Distributed run completed ' + created.batch.id + ': ' + current.batch.status, current.batch.status !== 'succeeded');
+    }
+
     async function submitConsoleForm(formElement = document.getElementById('consoleForm')) {
       const runButton = document.getElementById('runConsoleTask');
       try {
         runButton.disabled = true;
         await runConsoleTask(new FormData(formElement));
+      } finally {
+        runButton.disabled = false;
+      }
+    }
+
+    async function submitConsoleDistributed(formElement = document.getElementById('consoleForm')) {
+      const runButton = document.getElementById('runConsoleDistributed');
+      try {
+        runButton.disabled = true;
+        await runConsoleDistributed(new FormData(formElement));
       } finally {
         runButton.disabled = false;
       }
@@ -5955,6 +6040,13 @@ export function dashboardHtml(options = {}) {
         return;
       }
       document.getElementById('consoleForm').requestSubmit();
+    });
+    document.getElementById('runConsoleDistributed').addEventListener('click', async () => {
+      try {
+        await submitConsoleDistributed(document.getElementById('consoleForm'));
+      } catch (error) {
+        setStatus(error.message, true);
+      }
     });
     document.getElementById('stopConsoleTask').addEventListener('click', async () => {
       try {

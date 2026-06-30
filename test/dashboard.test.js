@@ -67,6 +67,10 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /consoleAgentNotice/);
     assert.match(html, /Demo echo agent is active/);
     assert.match(html, /consoleForm/);
+    assert.match(html, /runConsoleDistributed/);
+    assert.match(html, /Run Distributed/);
+    assert.match(html, /\/api\/planner\/run/);
+    assert.match(html, /consoleDistributedRequestFromForm/);
     assert.match(html, /console-routing-options/);
     assert.match(html, /console-routing-grid/);
     assert.match(html, /Routing Options/);
