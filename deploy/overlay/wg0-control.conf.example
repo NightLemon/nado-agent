@@ -1,0 +1,10 @@
+[Interface]
+Address = 10.77.0.1/24
+ListenPort = 51820
+PrivateKey = <control-private-key>
+
+[Peer]
+# Home Worker: it may originate tunnel traffic but owns only this tunnel IP.
+PublicKey = <home-worker-public-key>
+AllowedIPs = 10.77.0.2/32
+

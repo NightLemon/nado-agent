@@ -1,7 +1,9 @@
 services:
   control:
-    build: .
-    image: nado-agent:local
+    build:
+      context: .
+      target: control
+    image: nado-agent-control:local
     command:
       - control
       - start
@@ -22,8 +24,36 @@ services:
       NADO_INTERNAL_CONTROL_URL: http://127.0.0.1:8765
       NADO_DASHBOARD_AUTO_TOKEN: "true"
       NADO_PUBLIC_CONTROL_URL: ${NADO_PUBLIC_CONTROL_URL:-}
+      NADO_TRUST_PROXY: ${NADO_TRUST_PROXY:-false}
+      NADO_TRUST_PROXY_SECRET: ${NADO_TRUST_PROXY_SECRET:-}
+      NADO_AUTO_RECOVER_OFFLINE_MS: ${NADO_AUTO_RECOVER_OFFLINE_MS:-0}
+      NADO_TASK_LEASE_MS: ${NADO_TASK_LEASE_MS:-60000}
+      NADO_CONTROL_DATA_LEASE_TIMEOUT_MS: ${NADO_CONTROL_DATA_LEASE_TIMEOUT_MS:-60000}
+      NADO_CONTROL_DATA_LEASE_HEARTBEAT_MS: ${NADO_CONTROL_DATA_LEASE_HEARTBEAT_MS:-10000}
+      NADO_NETWORK_PROBE_MIN_INTERVAL_MS: ${NADO_NETWORK_PROBE_MIN_INTERVAL_MS:-30000}
+      NADO_JSON_BODY_MAX_BYTES: ${NADO_JSON_BODY_MAX_BYTES:-67108864}
+      NADO_RATE_LIMIT_WINDOW_MS: ${NADO_RATE_LIMIT_WINDOW_MS:-60000}
+      NADO_RATE_LIMIT_IP: ${NADO_RATE_LIMIT_IP:-1800}
+      NADO_RATE_LIMIT_ADMIN: ${NADO_RATE_LIMIT_ADMIN:-600}
+      NADO_RATE_LIMIT_WORKER: ${NADO_RATE_LIMIT_WORKER:-1800}
+      NADO_RATE_LIMIT_ENROLLMENT: ${NADO_RATE_LIMIT_ENROLLMENT:-60}
+      NADO_AUDIT_NDJSON_FILE: ${NADO_AUDIT_NDJSON_FILE:-}
+      NADO_AUDIT_NDJSON_MAX_PENDING: ${NADO_AUDIT_NDJSON_MAX_PENDING:-1024}
     volumes:
       - nado-control-data:/data/control
+      - nado-control-audit:/data/audit
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=67108864,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETPCAP
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8765/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 2s
@@ -31,13 +61,26 @@ services:
       retries: 20
 
   worker-code:
-    image: nado-agent:local
-    build: .
+    image: nado-agent-worker:local
+    build:
+      context: .
+      target: worker
     depends_on:
       control:
         condition: service_healthy
     environment:
       NADO_TOKEN: ${NADO_TOKEN:-docker-demo-token}
+      NADO_ARTIFACT_INLINE_MAX_BYTES: ${NADO_ARTIFACT_INLINE_MAX_BYTES:-5242880}
+      NADO_ARTIFACT_INLINE_TOTAL_BYTES: ${NADO_ARTIFACT_INLINE_TOTAL_BYTES:-20971520}
+      NADO_ARTIFACT_CHUNK_BYTES: ${NADO_ARTIFACT_CHUNK_BYTES:-4194304}
+      NADO_INPUT_INLINE_MAX_BYTES: ${NADO_INPUT_INLINE_MAX_BYTES:-5242880}
+      NADO_INPUT_INLINE_TOTAL_BYTES: ${NADO_INPUT_INLINE_TOTAL_BYTES:-20971520}
+      NADO_INPUT_CHUNK_BYTES: ${NADO_INPUT_CHUNK_BYTES:-4194304}
+      NADO_NETWORK_PROBE_BYTES: ${NADO_NETWORK_PROBE_BYTES:-65536}
+      NADO_NETWORK_PROBE_INTERVAL_MS: ${NADO_NETWORK_PROBE_INTERVAL_MS:-300000}
+      NADO_WORKER_COMPLETION_RETRIES: ${NADO_WORKER_COMPLETION_RETRIES:-16}
+      NADO_WORKER_COMPLETION_RETRY_BASE_MS: ${NADO_WORKER_COMPLETION_RETRY_BASE_MS:-250}
+      NADO_WORKER_COMPLETION_RETRY_MAX_MS: ${NADO_WORKER_COMPLETION_RETRY_MAX_MS:-5000}
     command:
       - worker
       - start
@@ -70,13 +113,26 @@ services:
       - "${USERPROFILE}/.claude.json:/root/.claude.json"
 
   worker-gpu:
-    image: nado-agent:local
-    build: .
+    image: nado-agent-worker:local
+    build:
+      context: .
+      target: worker
     depends_on:
       control:
         condition: service_healthy
     environment:
       NADO_TOKEN: ${NADO_TOKEN:-docker-demo-token}
+      NADO_ARTIFACT_INLINE_MAX_BYTES: ${NADO_ARTIFACT_INLINE_MAX_BYTES:-5242880}
+      NADO_ARTIFACT_INLINE_TOTAL_BYTES: ${NADO_ARTIFACT_INLINE_TOTAL_BYTES:-20971520}
+      NADO_ARTIFACT_CHUNK_BYTES: ${NADO_ARTIFACT_CHUNK_BYTES:-4194304}
+      NADO_INPUT_INLINE_MAX_BYTES: ${NADO_INPUT_INLINE_MAX_BYTES:-5242880}
+      NADO_INPUT_INLINE_TOTAL_BYTES: ${NADO_INPUT_INLINE_TOTAL_BYTES:-20971520}
+      NADO_INPUT_CHUNK_BYTES: ${NADO_INPUT_CHUNK_BYTES:-4194304}
+      NADO_NETWORK_PROBE_BYTES: ${NADO_NETWORK_PROBE_BYTES:-65536}
+      NADO_NETWORK_PROBE_INTERVAL_MS: ${NADO_NETWORK_PROBE_INTERVAL_MS:-300000}
+      NADO_WORKER_COMPLETION_RETRIES: ${NADO_WORKER_COMPLETION_RETRIES:-16}
+      NADO_WORKER_COMPLETION_RETRY_BASE_MS: ${NADO_WORKER_COMPLETION_RETRY_BASE_MS:-250}
+      NADO_WORKER_COMPLETION_RETRY_MAX_MS: ${NADO_WORKER_COMPLETION_RETRY_MAX_MS:-5000}
     command:
       - worker
       - start
@@ -105,5 +161,6 @@ services:
 
 volumes:
   nado-control-data:
+  nado-control-audit:
   nado-worker-code-data:
   nado-worker-gpu-data:

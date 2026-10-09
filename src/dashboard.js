@@ -1,12 +1,14 @@
 export function dashboardHtml(options = {}) {
   const bootstrapToken = options.bootstrapToken ? String(options.bootstrapToken) : '';
+  const cspNonce = String(options.cspNonce || '').replace(/[^A-Za-z0-9_-]/g, '');
+  const nonceAttribute = cspNonce ? ` nonce="${cspNonce}"` : '';
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Nado Control</title>
-  <style>
+  <style${nonceAttribute}>
     :root {
       color-scheme: light;
       --bg: #eef2f6;
@@ -165,7 +167,7 @@ export function dashboardHtml(options = {}) {
     }
     .readiness-strip {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 8px;
       margin: -4px 0 12px;
     }
@@ -191,6 +193,59 @@ export function dashboardHtml(options = {}) {
     .readiness-item.ok { border-color: #9bd8b8; background: #f6fef9; }
     .readiness-item.warn { border-color: #f1c36d; background: #fffbeb; }
     .readiness-item.bad { border-color: #fda29b; background: #fff5f5; }
+    .topology-panel {
+      margin: 0 0 12px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+    }
+    .topology-heading {
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .topology-heading strong { font-size: 14px; }
+    .topology-heading small { color: var(--muted); text-align: right; }
+    .topology-flow {
+      display: grid;
+      grid-template-columns: minmax(240px, .9fr) minmax(150px, .45fr) minmax(300px, 1.65fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+    .topology-node,
+    .topology-worker {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }
+    .topology-node.control { border-color: #b7cdfa; background: #f5f8ff; }
+    .topology-node strong,
+    .topology-worker strong { display: block; margin: 5px 0; overflow-wrap: anywhere; }
+    .topology-meta { color: var(--muted); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+    .topology-link {
+      display: grid;
+      place-items: center;
+      color: var(--blue-strong);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.45;
+      text-align: center;
+    }
+    .topology-link span::before { content: '\\2190'; display: block; font-size: 25px; line-height: 1; }
+    .topology-workers { display: grid; gap: 8px; }
+    .topology-worker.online { border-color: #9bd8b8; background: #f6fef9; }
+    .topology-worker.offline { opacity: .72; }
+    .topology-worker-head { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+    .topology-receipt {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--line);
+    }
     .view-tabs {
       display: flex;
       gap: 6px;
@@ -227,6 +282,47 @@ export function dashboardHtml(options = {}) {
     .console-section > h2 {
       grid-column: 1 / -1;
     }
+    .console-progress {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+      margin: 12px 14px 0;
+    }
+    .console-stage {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .console-stage span {
+      display: inline-grid;
+      width: 22px;
+      height: 22px;
+      flex: 0 0 auto;
+      place-items: center;
+      border-radius: 50%;
+      background: #e4e9f1;
+      color: #475467;
+      font-size: 11px;
+    }
+    .console-stage.active {
+      border-color: #b7cdfa;
+      background: #f5f8ff;
+      color: var(--blue-strong);
+    }
+    .console-stage.active span { background: var(--blue); color: #fff; }
+    .console-stage.done { border-color: #9bd8b8; background: #f6fef9; color: var(--green); }
+    .console-stage.done span { background: var(--green); color: #fff; }
+    .console-stage.bad { border-color: #fda29b; background: #fff5f5; color: var(--red); }
+    .console-stage.bad span { background: var(--red); color: #fff; }
     .console-agent-notice {
       grid-column: 1 / -1;
       margin: 14px 14px 0;
@@ -360,7 +456,7 @@ export function dashboardHtml(options = {}) {
     }
     .stat {
       padding: 10px 12px;
-      min-height: 66px;
+      min-height: 60px;
     }
     .stat span {
       display: block;
@@ -370,7 +466,8 @@ export function dashboardHtml(options = {}) {
     .stat strong {
       display: block;
       margin-top: 3px;
-      font-size: 22px;
+      font-size: 17px;
+      line-height: 1.3;
       letter-spacing: 0;
     }
     section {
@@ -632,6 +729,13 @@ export function dashboardHtml(options = {}) {
       padding: 4px 8px;
       font-size: 12px;
     }
+    .task-search {
+      width: min(280px, 100%);
+      min-height: 30px;
+      padding: 4px 9px;
+      font-size: 12px;
+    }
+    .workbench-task-tools .task-search { margin-left: auto; }
     .field-warning {
       min-height: 16px;
       margin-top: 4px;
@@ -718,6 +822,9 @@ export function dashboardHtml(options = {}) {
       .grid { grid-template-columns: 1fr; }
       .stats { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
       .readiness-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .topology-flow { grid-template-columns: 1fr; }
+      .topology-link span::before { content: '\\2191'; }
+      .console-progress { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .detail-grid { grid-template-columns: repeat(2, minmax(110px, 1fr)); }
       .console-section { grid-template-columns: 1fr; }
       .console-section > form,
@@ -765,6 +872,7 @@ export function dashboardHtml(options = {}) {
   <main>
     <div class="stats" id="stats"></div>
     <div id="readinessStrip" class="readiness-strip"></div>
+    <div id="crossSiteTopology" class="topology-panel" aria-live="polite"></div>
     <nav class="view-tabs" aria-label="Dashboard sections">
       <button type="button" class="active" data-view-tab="workbench">Workbench</button>
       <button type="button" data-view-tab="workers">Workers</button>
@@ -776,6 +884,12 @@ export function dashboardHtml(options = {}) {
     </nav>
     <section class="console-section">
       <h2>Control Console</h2>
+      <div id="consoleProgress" class="console-progress" aria-label="Execution progress">
+        <div class="console-stage active" data-console-stage="prepare"><span>1</span><b>Prepare</b></div>
+        <div class="console-stage" data-console-stage="route"><span>2</span><b>Route</b></div>
+        <div class="console-stage" data-console-stage="execute"><span>3</span><b>Execute</b></div>
+        <div class="console-stage" data-console-stage="result"><span>4</span><b>Result</b></div>
+      </div>
       <div id="consoleAgentNotice" class="console-agent-notice">Loading agent capability...</div>
       <form id="consoleForm" class="console-form">
         <div class="wide">
@@ -854,15 +968,17 @@ export function dashboardHtml(options = {}) {
             <h2>Tasks</h2>
             <div class="workbench-task-tools actions">
               <button id="clearWorkbenchCompleted" type="button">Reset Demo</button>
+              <input class="task-search" type="search" data-task-search placeholder="Search tasks">
             </div>
             <div class="attention-tools">
               <div class="subhead">Needs Attention</div>
               <button id="cancelRoutingIssues" type="button" disabled>Cancel Issues</button>
             </div>
-            <div id="attentionTasks" class="empty">No routing issues</div>
+            <div id="attentionTasks" class="empty">No task issues</div>
             <div class="section-tools">
               <button type="button" data-task-filter="user">User Tasks</button>
               <button type="button" data-task-filter="all">All History</button>
+              <input class="task-search" type="search" data-task-search placeholder="Search tasks">
               <label class="inline-control" for="taskPruneKeep">Keep</label>
               <input id="taskPruneKeep" class="compact-input" type="number" min="0" value="20">
               <button id="pruneTaskHistory" type="button">Clear Completed</button>
@@ -932,9 +1048,14 @@ export function dashboardHtml(options = {}) {
             <div>
               <label for="inviteDataDir">Data dir</label>
               <input id="inviteDataDir" name="dataDir" value=".nado">
+              <small>For production upgrades, use one absolute host path outside extracted bundle folders and keep it unchanged.</small>
             </div>
             <div class="wide">
               <label><input id="inviteCleanup" name="cleanupWorkspaces" type="checkbox"> Cleanup non-session workspaces</label>
+            </div>
+            <div class="wide">
+              <label><input id="inviteStrictLocalReadiness" name="strictLocalReadiness" type="checkbox" checked> Strict local readiness before self-service start</label>
+              <small>Fail before enrollment when local runtime checks fail; after signed preflight, validate the enrolled Ed25519 identity before starting the Worker.</small>
             </div>
             <details class="advanced-panel wide">
               <summary><span>Advanced Fixed-ID Invite</span><small>for pre-named hosts only</small></summary>
@@ -978,6 +1099,7 @@ export function dashboardHtml(options = {}) {
               <button id="loadWorkerTokens" type="button">Refresh Tokens</button>
             </div>
           </div>
+          <p class="hint"><span>Rotate self-service credentials on the Worker host with</span> <span class="mono">nado worker token rotate</span>. <span>The old token stays valid until the replacement is atomically persisted and confirmed.</span></p>
           <div id="workerTokens" class="empty">No token list loaded</div>
           <div class="subhead">Enrollment Tokens</div>
           <div class="actions">
@@ -1070,6 +1192,61 @@ export function dashboardHtml(options = {}) {
           <div id="verifyResult" class="empty">No readiness verification run yet</div>
         </section>
         <section>
+          <h2>Cross-Site Acceptance</h2>
+          <form id="acceptanceForm" class="form-grid">
+            <div>
+              <label for="acceptanceWorker">Home Worker</label>
+              <input id="acceptanceWorker" name="workerId" placeholder="home-worker-id">
+            </div>
+            <div>
+              <label><input id="acceptanceRequireGpu" name="requireGpu" type="checkbox"> Require probed GPU</label>
+            </div>
+            <div>
+              <label><input id="acceptanceRequireAgent" name="requireAgent" type="checkbox" checked> Require verified terminal Agent</label>
+            </div>
+            <div>
+              <label><input id="acceptanceRunVerify" name="runVerify" type="checkbox"> Run end-to-end verify tasks</label>
+            </div>
+            <div>
+              <label for="acceptanceTimeout">Verify timeout ms</label>
+              <input id="acceptanceTimeout" name="timeoutMs" type="number" min="1000" value="60000">
+            </div>
+            <div>
+              <label for="acceptanceDeploymentMode">Network deployment</label>
+              <select id="acceptanceDeploymentMode" name="deploymentMode">
+                <option value="">auto from current URL</option>
+                <option value="public_https">public HTTPS</option>
+                <option value="tailscale">Tailscale</option>
+                <option value="wireguard">WireGuard</option>
+              </select>
+            </div>
+            <div>
+              <label for="acceptanceOverlayInterface">Overlay interface</label>
+              <input id="acceptanceOverlayInterface" name="overlayInterface" placeholder="tailscale0 or wg0">
+            </div>
+            <div>
+              <label for="acceptanceDeploymentEvidence">Deployment receipt JSON</label>
+              <input id="acceptanceDeploymentEvidence" name="deploymentEvidence" type="file" accept=".json,application/json">
+              <small id="acceptanceDeploymentEvidenceStatus">Required for the strict live gate</small>
+            </div>
+            <div>
+              <label for="acceptanceManualEvidence">Acceptance evidence JSON</label>
+              <input id="acceptanceManualEvidence" name="manualEvidence" type="file" accept=".json,application/json">
+              <small id="acceptanceManualEvidenceStatus">Load the evidence document updated by the runbook</small>
+            </div>
+            <div class="wide actions">
+              <button id="runAcceptanceGate" class="primary" type="button">Run Live Gate</button>
+              <button id="downloadAcceptanceEvidence" type="button">Download Evidence Template</button>
+              <button id="copyAcceptanceCommand" type="button">Copy Shared Runbook</button>
+              <button id="downloadAcceptanceReport" type="button" disabled>Download Live Report</button>
+            </div>
+          </form>
+          <p class="hint">Run the target-Worker exercise, record the remaining real VM/home-host scenarios, then generate the strict report. NADO_TOKEN stays in the shell environment.</p>
+          <div id="acceptanceRunbookProgress" class="empty">Load a Worker and evidence files to review runbook progress</div>
+          <div id="acceptanceReportResult" class="empty">No live acceptance gate run yet</div>
+          <pre id="acceptanceCommand">Select a home Worker to build the acceptance command</pre>
+        </section>
+        <section>
           <h2>Agent Context</h2>
           <div class="actions">
             <button id="loadAgentContext" type="button">Refresh Context</button>
@@ -1107,10 +1284,33 @@ export function dashboardHtml(options = {}) {
           <pre id="mcpConfig">No MCP config loaded</pre>
         </section>
         <section>
+          <h2>Audit Trail</h2>
+          <div class="form-grid">
+            <div>
+              <label for="auditTail">Recent events</label>
+              <input id="auditTail" type="number" min="1" max="1000" value="100">
+            </div>
+            <div>
+              <label for="auditOutcome">Outcome</label>
+              <select id="auditOutcome">
+                <option value="">all</option>
+                <option value="success">success</option>
+                <option value="denied">denied</option>
+                <option value="error">error</option>
+              </select>
+            </div>
+            <div class="wide actions">
+              <button id="loadAuditTrail" type="button">Refresh Audit</button>
+              <button id="downloadAuditTrail" type="button">Download NDJSON</button>
+            </div>
+          </div>
+          <div id="auditTrail" class="empty">No audit events loaded</div>
+        </section>
+        <section>
           <h2>Offline Recovery</h2>
           <form id="recoveryForm" class="form-grid">
             <div>
-              <label for="recoveryWorker">Offline worker</label>
+              <label for="recoveryWorker">Worker filter</label>
               <input id="recoveryWorker" name="workerId" placeholder="optional worker id">
             </div>
             <div>
@@ -1134,7 +1334,7 @@ export function dashboardHtml(options = {}) {
               <input id="recoverySlots" name="slots" type="number" min="1" placeholder="optional">
             </div>
             <div class="wide">
-              <label><input id="recoveryIncludeSessions" name="includeSessions" type="checkbox"> Include session tasks</label>
+              <label><input id="recoveryIncludeSessions" name="includeSessions" type="checkbox"> Allow session migration (worker-local workspace may be lost)</label>
             </div>
             <div class="wide">
               <label for="recoveryReason">Reason</label>
@@ -1142,10 +1342,10 @@ export function dashboardHtml(options = {}) {
             </div>
             <div class="wide actions">
               <button id="loadRecoveryCandidates" type="button">Refresh Offline</button>
-              <button id="recoverOfflineTasks" class="primary" type="submit">Requeue Offline</button>
+              <button id="recoverOfflineTasks" class="primary" type="submit">Recover Tasks</button>
             </div>
           </form>
-          <div id="recoveryCandidates" class="empty">No offline recovery scan loaded</div>
+          <div id="recoveryCandidates" class="empty">No recovery scan loaded</div>
         </section>
         <section>
           <h2>Submit Task</h2>
@@ -1194,6 +1394,34 @@ export function dashboardHtml(options = {}) {
               <input id="slots" name="slots" type="number" min="1" value="1">
             </div>
             <div>
+              <label for="resourcePlatform">Operating system</label>
+              <input id="resourcePlatform" name="resourcePlatform" placeholder="linux, win32, or darwin">
+            </div>
+            <div>
+              <label for="resourceArch">CPU architecture</label>
+              <input id="resourceArch" name="resourceArch" placeholder="x64 or arm64">
+            </div>
+            <div>
+              <label for="resourceCpu">CPU cores</label>
+              <input id="resourceCpu" name="resourceCpu" type="number" min="0" step="0.5" placeholder="4">
+            </div>
+            <div>
+              <label for="resourceMemory">Memory</label>
+              <input id="resourceMemory" name="resourceMemory" placeholder="16GiB">
+            </div>
+            <div>
+              <label for="resourceGpuCount">GPU count</label>
+              <input id="resourceGpuCount" name="resourceGpuCount" type="number" min="0" placeholder="1">
+            </div>
+            <div>
+              <label for="resourceVram">GPU memory</label>
+              <input id="resourceVram" name="resourceVram" placeholder="12GiB">
+            </div>
+            <div>
+              <label for="resourceGpuModel">GPU model</label>
+              <input id="resourceGpuModel" name="resourceGpuModel" placeholder="RTX 4090">
+            </div>
+            <div>
               <label for="tool">Required tool</label>
               <input id="tool" name="tool" placeholder="node,codex">
             </div>
@@ -1201,6 +1429,32 @@ export function dashboardHtml(options = {}) {
               <label for="timeoutMs">Timeout ms</label>
               <input id="timeoutMs" name="timeoutMs" type="number" min="1000" placeholder="600000">
             </div>
+            <details class="advanced-panel wide">
+              <summary><span>Failure Retry Policy</span><small>opt in only for safe, idempotent work</small></summary>
+              <div class="advanced-grid">
+                <div>
+                  <label for="maxAttempts">Maximum attempts</label>
+                  <input id="maxAttempts" name="maxAttempts" type="number" min="1" max="100" value="3">
+                </div>
+                <div>
+                  <label for="retryFailureKinds">Retry failure kinds</label>
+                  <input id="retryFailureKinds" name="retryFailureKinds" placeholder="timeout,worker_error">
+                </div>
+                <div>
+                  <label for="retryExitCodes">Retry exit codes</label>
+                  <input id="retryExitCodes" name="retryExitCodes" placeholder="75,124">
+                </div>
+                <div>
+                  <label for="retryBackoffMs">Initial retry delay ms</label>
+                  <input id="retryBackoffMs" name="retryBackoffMs" type="number" min="0" value="1000">
+                </div>
+                <div>
+                  <label for="maxRetryBackoffMs">Maximum retry delay ms</label>
+                  <input id="maxRetryBackoffMs" name="maxRetryBackoffMs" type="number" min="0" value="60000">
+                </div>
+                <div class="wide hint">Cancellation and configuration errors are never retried automatically.</div>
+              </div>
+            </details>
             <div>
               <label for="workspacePolicy">Workspace</label>
               <select id="workspacePolicy" name="workspacePolicy">
@@ -1421,6 +1675,14 @@ export function dashboardHtml(options = {}) {
               <label for="sessionLabel">Required label</label>
               <input id="sessionLabel" name="label" placeholder="zone=lab">
             </div>
+            <div>
+              <label for="sessionResourcePlatform">Operating system</label>
+              <input id="sessionResourcePlatform" name="resourcePlatform" placeholder="linux, win32, or darwin">
+            </div>
+            <div>
+              <label for="sessionResourceArch">CPU architecture</label>
+              <input id="sessionResourceArch" name="resourceArch" placeholder="x64 or arm64">
+            </div>
             <div class="wide">
               <button class="primary" type="submit">Create Session</button>
             </div>
@@ -1437,8 +1699,8 @@ export function dashboardHtml(options = {}) {
       </div>
     </div>
   </main>
-  <script>
-    const DASHBOARD_UI_VERSION = '2026-06-29-workbench-access-tab-v1';
+  <script${nonceAttribute}>
+    const DASHBOARD_UI_VERSION = '2026-08-19-cross-site-ops-v3';
     const DASHBOARD_VIEWS = ['workbench', 'workers', 'onboarding', 'tasks', 'batches', 'sessions', 'ops'];
 
     function initialDashboardView() {
@@ -1470,20 +1732,24 @@ export function dashboardHtml(options = {}) {
       consoleArtifactTaskId: null,
       consoleArtifactPreview: '',
       networkInfo: null,
+      acceptanceRunbook: null,
+      acceptanceReport: null,
+      acceptanceDeploymentEvidence: null,
+      acceptanceManualEvidence: null,
       statusHoldUntil: 0,
       inviteControlTouched: false,
       activeView: initialDashboardView(),
       taskFilter: localStorage.getItem('nadoTaskFilter') || 'user',
+      taskSearch: localStorage.getItem('nadoTaskSearch') || '',
       showEnrollmentHistory: localStorage.getItem('nadoShowEnrollmentHistory') === 'true',
     };
     const tokenInput = document.getElementById('token');
     const localeInput = document.getElementById('locale');
     const statusEl = document.getElementById('status');
     const bootstrapToken = ${JSON.stringify(bootstrapToken)};
-    if (bootstrapToken) {
-      localStorage.setItem('nadoToken', bootstrapToken);
-    }
-    tokenInput.value = localStorage.getItem('nadoToken') || bootstrapToken || '';
+    localStorage.removeItem('nadoToken');
+    sessionStorage.removeItem('nadoToken');
+    tokenInput.value = bootstrapToken || '';
     const textSources = new WeakMap();
     const attrSources = new WeakMap();
     const translations = {
@@ -1497,8 +1763,40 @@ export function dashboardHtml(options = {}) {
         'Agent Runtime': 'Agent 运行时',
         'GPU Routing': 'GPU 路由',
         'Auto Routing': '自动路由',
+        'Automatic Recovery': '自动恢复',
+        'Audit Shipping': '审计外送',
+        'External audit mirror healthy': '外部审计镜像正常',
+        'External audit mirror degraded': '外部审计镜像异常',
+        'External audit mirror disabled': '外部审计镜像未启用',
+        'Cross-Site Topology': '跨站点拓扑',
+        'Workers initiate outbound poll and heartbeat requests; no Worker inbound port is required.': '工作端主动发起出站轮询和心跳请求，无需开放工作端入站端口。',
+        'VM Control Plane': 'VM 控制面',
+        'Instance': '实例',
+        'Started': '启动时间',
+        'Storage': '存储',
+        'Data lease': '数据目录租约',
+        'write fenced': '写入隔离已启用',
+        'State': '状态版本',
+        'Schema': '结构版本',
+        'Worker outbound connection': '工作端主动出站连接',
+        'No workers registered': '尚未注册工作端',
+        'Ed25519 signed': 'Ed25519 已签名',
+        'Unsigned identity': '未签名身份',
+        'Public source': '公网来源',
+        'Private or overlay source': '私网或组网来源',
+        'Loopback source': '回环来源',
+        'Unknown source': '未知来源',
+        'Observed': '观测时间',
+        'Restore receipt': '恢复收据',
+        'Restored': '恢复时间',
+        'Backup source': '备份时间',
+        'Manifest SHA-256': '清单 SHA-256',
+        'No restore receipt; this control is using its original data directory.': '没有恢复收据；当前控制面使用原始数据目录。',
+        'Enabled for ordinary tasks and same-worker sessions': '已为普通任务和同工作端会话启用',
+        'Manual recovery only': '仅手动恢复',
         'Waiting for gateway state': '等待网关状态',
         'Ready for remote workers': '远端工作端连接已就绪',
+        'Current request did not authenticate as the configured reverse proxy; forwarded headers are ignored': '当前请求未通过反向代理认证；转发头已被忽略',
         'Configure public URL for IPv6/LAN workers': '请为 IPv6/局域网工作端配置公共 URL',
         'Scan network URL from Worker Onboarding': '请在工作端接入里扫描网络 URL',
         'IPv6 literals must use brackets, for example http://[2001:db8::10]:8765': 'IPv6 字面量必须使用方括号，例如 http://[2001:db8::10]:8765',
@@ -1516,6 +1814,10 @@ export function dashboardHtml(options = {}) {
         'Onboarding': '接入',
         'Forget': '移除记录',
         'Control Console': '主控控制台',
+        'Execution progress': '执行进度',
+        'Prepare': '准备',
+        'Route': '路由',
+        'Execute': '执行',
         'Loading agent capability...': '正在加载 Agent 能力...',
         'Demo echo agent is active. It validates scheduling and artifact flow, but it does not analyze prompts. Start a worker with Codex or Claude to run real agent work.': '当前启用的是演示回显 Agent。它可以验证调度和产物流，但不会真正分析提示词。启动带 Codex 或 Claude 的工作端后才能执行真实 Agent 工作。',
         'No active terminal agent worker is ready.': '当前没有可用的终端 Agent 工作端。',
@@ -1550,8 +1852,36 @@ export function dashboardHtml(options = {}) {
         'Tasks': '任务',
         'Needs Attention': '需要处理',
         'Next Action': '下一步',
+        'Runtime': '运行状态',
+        'Runtime Issue': '运行异常',
+        'Build': '构建版本',
+        'Build match': '构建一致',
+        'Build drift': '构建漂移',
+        'Build unknown': '构建未知',
+        'Protocol mismatch': '协议不匹配',
         'No routing issues': '暂无路由问题',
+        'No task issues': '暂无任务问题',
         'Cancel Issues': '取消异常任务',
+        'running_healthy': '运行健康',
+        'worker_heartbeat_stale': '工作端心跳中断',
+        'lease_expired': '租约已过期',
+        'lease_missing': '租约缺失',
+        'retry_backoff': '等待重试退避',
+        'waiting_for_session_worker': '等待原会话工作端',
+        'session_worker_disabled': '会话工作端未启用',
+        'waiting_for_session_worker_slot': '等待会话工作端槽位',
+        'awaiting_session_claim': '等待会话任务领取',
+        'awaiting_claim': '等待任务领取',
+        'awaiting_route': '等待路由',
+        'terminal': '已结束',
+        'recover_on_session_worker': '在原会话工作端恢复',
+        'recover_expired_task': '恢复过期任务',
+        'inspect_missing_task_lease': '检查缺失的任务租约',
+        'restore_worker_before_lease_expiry': '在租约过期前恢复工作端',
+        'wait_for_retry_backoff': '等待重试退避',
+        'reconnect_session_worker': '重连原会话工作端',
+        'enable_session_worker': '启用会话工作端',
+        'wait_for_session_worker_slot': '等待会话工作端容量',
         'User Tasks': '用户任务',
         'All History': '全部历史',
         'Keep': '保留',
@@ -1564,6 +1894,7 @@ export function dashboardHtml(options = {}) {
         'Clear completed verify/doctor system history': '清理已完成的 verify/doctor 系统历史',
         'Showing recent user tasks': '显示最近用户任务',
         'Showing all recent history': '显示全部最近历史',
+        'Search tasks': '搜索任务',
         'Task Detail': '任务详情',
         'Select a task': '选择一个任务',
         'Worker Onboarding': '工作端接入',
@@ -1612,6 +1943,7 @@ export function dashboardHtml(options = {}) {
         'Agent command': 'Agent 命令',
         'Token label': '令牌标签',
         'Data dir': '数据目录',
+        'For production upgrades, use one absolute host path outside extracted bundle folders and keep it unchanged.': '生产升级请使用解压运行目录之外的固定绝对路径，并在后续版本中保持不变。',
         'Cleanup non-session workspaces': '清理非会话工作区',
         'Issue Fixed-ID Invite': '签发固定 ID 邀请',
         'Fixed-ID Invite Script': '固定 ID 邀请脚本',
@@ -1624,8 +1956,19 @@ export function dashboardHtml(options = {}) {
         'probe': '探测到',
         'advertised': '已声明',
         'none': '无',
-        'gpu capability is advertised but no NVIDIA/ROCm probe was reported; verify the worker GPU runtime before scheduling real accelerator workloads': '工作端声明了 GPU 能力，但没有上报 NVIDIA/ROCm 探测结果；调度真实加速任务前请先确认工作端 GPU 运行时。',
+        'gpu capability is advertised but no NVIDIA/AMD SMI probe was reported; verify the worker GPU runtime before scheduling real accelerator workloads': '工作端声明了 GPU 能力，但没有上报 NVIDIA/AMD SMI 探测结果；调度真实加速任务前请先确认工作端 GPU 运行时。',
         'Agent readiness': 'Agent 就绪',
+        'Authentication': '认证方式',
+        'Signed Worker token': '签名工作端令牌',
+        'Unsigned Worker token': '未签名工作端令牌',
+        'Administrator credential': '管理员凭据',
+        'Unknown identity': '未知身份',
+        'Source Address': '来源地址',
+        'Transport': '传输方式',
+        'Trusted proxy': '可信代理',
+        'Authenticated proxy': '已认证代理',
+        'Unauthenticated proxy evidence': '未认证的代理证据',
+        'Direct socket': '直接连接',
         'Run Agent Self-Test': '运行 Agent 自测',
         'Run an agent self-test on this worker? This may call the configured Codex or Claude CLI.': '要在这个工作端运行 Agent 自测吗？这可能会调用已配置的 Codex 或 Claude CLI。',
         'real-terminal-agent': '真实终端 Agent',
@@ -1646,6 +1989,14 @@ export function dashboardHtml(options = {}) {
         'agent command is configured, but no successful agent self-test has been recorded yet': 'Agent 命令已配置，但还没有记录成功的 Agent 自测。',
         'custom agent command is configured; run an agent self-test before trusting real agent work': '已配置自定义 Agent 命令；信任真实 Agent 工作前请先运行 Agent 自测。',
         'Worker Tokens': '工作端令牌',
+        'Rotate self-service credentials on the Worker host with': '请在工作端主机上轮换自助接入凭据：',
+        'The old token stays valid until the replacement is atomically persisted and confirmed.': '旧令牌会保持有效，直到替代令牌完成原子持久化并确认。',
+        'Rotates From': '替代来源',
+        'Rotation Deadline': '轮换确认期限',
+        'Confirmed': '确认时间',
+        'rotation pending': '等待轮换确认',
+        'rotated': '已轮换',
+        'expired': '已过期',
         'Enrollment Tokens': '接入注册令牌',
         'Worker': '工作端',
         'Routing': '路由',
@@ -1669,8 +2020,23 @@ export function dashboardHtml(options = {}) {
         'Evidence': '证据',
         'Required tool': '必需工具',
         'Required label': '必需标签',
+        'Operating system': '操作系统',
+        'CPU architecture': 'CPU 架构',
         'Timeout ms': '超时 ms',
+        'Failure Retry Policy': '失败重试策略',
+        'opt in only for safe, idempotent work': '仅为安全且幂等的任务启用',
+        'Maximum attempts': '最大尝试次数',
+        'Retry failure kinds': '重试失败分类',
+        'Retry exit codes': '重试退出码',
+        'Initial retry delay ms': '初始重试延迟 ms',
+        'Maximum retry delay ms': '最大重试延迟 ms',
+        'Cancellation and configuration errors are never retried automatically.': '取消和配置错误永远不会自动重试。',
+        'Failure Kind': '失败分类',
+        'Retry Policy': '重试策略',
+        'Next Retry': '下次重试',
+        'Attempts': '尝试次数',
         'Run self-test task': '运行自测任务',
+        'Run agent self-test task': '运行 Agent 自测任务',
         'Probe every eligible worker': '探测所有符合条件的工作端',
         'Run Doctor': '运行诊断',
         'No doctor run yet': '尚未运行诊断',
@@ -1679,6 +2045,77 @@ export function dashboardHtml(options = {}) {
         'Skip doctor self-test': '跳过诊断自测',
         'Run Verify': '运行验证',
         'No readiness verification run yet': '尚未运行就绪验证',
+        'Cross-Site Acceptance': '跨站点验收',
+        'Home Worker': '家庭工作端',
+        'Require probed GPU': '要求已探测 GPU',
+        'Require verified terminal Agent': '要求已验证终端 Agent',
+        'Run end-to-end verify tasks': '运行端到端验证任务',
+        'Verify timeout ms': '验证超时 ms',
+        'Network deployment': '网络部署方式',
+        'auto from current URL': '根据当前 URL 自动判断',
+        'public HTTPS': '公网 HTTPS',
+        'Overlay interface': '私网组网接口',
+        'Deployment receipt JSON': '部署回执 JSON',
+        'Acceptance evidence JSON': '验收证据 JSON',
+        'Required for the strict live gate': '严格实时门禁必须提供此回执',
+        'Load the evidence document updated by the runbook': '载入由验收清单更新的证据文档',
+        'Load a Worker and evidence files to review runbook progress': '选择工作端并载入证据文件以查看验收清单进度',
+        'Runbook Progress': '验收清单进度',
+        'Step': '步骤',
+        'Title': '标题',
+        'Capture the network deployment boundary receipt': '采集网络部署边界回执',
+        'Create or validate the resumable evidence document': '创建或校验可续跑的证据文档',
+        'Record VM/home physical and network separation after inspection': '记录 VM 与家庭主机的物理及网络隔离证据',
+        'Record that the home Worker has no inbound listener or router forwarding': '记录家庭工作端未开放入站监听或路由器端口转发',
+        'Record the deployed overlay peer/ACL and public-port denial evidence': '记录私网组网节点、ACL 与公网端口拒绝证据',
+        'Prove VM-triggered process cancellation': '验证由 VM 发起的进程取消',
+        'Prove same-attempt recovery after a short link outage': '验证短时断网后同一次尝试恢复',
+        'Prove lease recovery and stale-result rejection after a long outage': '验证长时断网后的租约恢复与过期结果拒绝',
+        'Prove SQLite and Worker recovery across a VM Control restart': '验证 VM 控制面重启后的 SQLite 与工作端恢复',
+        'Prove the installed home Worker service recovers with the same signed identity and a new runtime': '验证已安装的家庭工作端服务以同一签名身份和新运行实例恢复',
+        'Prove resumable large artifact upload': '验证大产物断点续传',
+        'Prove resumable ranged large input download': '验证大输入分段下载断点续传',
+        'Prove verified backup/restore into a fresh Control directory': '验证备份校验并恢复到全新控制面目录',
+        'Prove two-turn real terminal-Agent collaboration': '验证真实终端 Agent 的两轮协作',
+        'Rotate the selected Worker credential and prove predecessor rejection': '轮换所选工作端凭据并验证旧凭据被拒绝',
+        'Run the strict final completeness gate': '运行最终严格完整性门禁',
+        'Run the deployment check and load deployment-check.json': '运行部署检查并载入 deployment-check.json',
+        'Run the live gate to validate the loaded deployment receipt': '运行实时门禁以验证已载入的部署回执',
+        'Run the live gate to validate the loaded evidence document': '运行实时门禁以验证已载入的证据文档',
+        'Load acceptance-evidence.json': '载入 acceptance-evidence.json',
+        'Run the live gate after every preceding step passes': '所有前置步骤通过后运行实时门禁',
+        'Replace every placeholder, run the command, and reload the evidence file': '替换所有占位符，运行命令并重新载入证据文件',
+        'Run this runbook step and reload the updated evidence file': '运行此验收步骤并重新载入更新后的证据文件',
+        'Evidence loaded; run the live gate to validate it': '证据已载入；运行实时门禁进行验证',
+        'Deployment receipt loaded; run the live gate to validate it': '部署回执已载入；运行实时门禁进行验证',
+        'No evidence document loaded': '尚未载入证据文档',
+        'No deployment receipt loaded': '尚未载入部署回执',
+        'ready': '待验证',
+        'not_run': '未运行',
+        'Run Live Gate': '运行实时门禁',
+        'Download Live Report': '下载实时报告',
+        'No live acceptance gate run yet': '尚未运行实时验收门禁',
+        'Automatic Checks': '自动检查',
+        'Manual Evidence': '人工证据',
+        'Next Actions': '下一步操作',
+        'Live Gate': '实时门禁',
+        'Required Checks': '必需检查',
+        'Required': '是否必需',
+        'Summary': '说明',
+        'Failed / Pending': '失败 / 待完成',
+        'required': '必需',
+        'passed': '通过',
+        'pending': '待完成',
+        'Running live cross-site gate...': '正在运行跨站点实时门禁...',
+        'Downloaded live acceptance report': '已下载实时验收报告',
+        'Download Evidence Template': '下载验收证据模板',
+        'Copy Shared Runbook': '复制共享验收清单',
+        'Copied shared cross-site acceptance runbook': '已复制共享跨站点验收清单',
+        'Loading acceptance runbook...': '正在加载验收清单…',
+        'Administrator token is required to load the shared acceptance runbook': '加载共享验收清单需要管理员令牌',
+        'Downloaded cross-site acceptance evidence template': '已下载跨站点验收证据模板',
+        'Run the target-Worker exercise, record the remaining real VM/home-host scenarios, then generate the strict report. NADO_TOKEN stays in the shell environment.': '先运行目标工作端验收练习，再记录其余真实 VM/家庭主机场景并生成严格报告。NADO_TOKEN 始终保留在 Shell 环境中。',
+        'Select a home Worker to build the acceptance command': '选择家庭工作端以生成验收命令',
         'No records': '暂无记录',
         'Agent Context': 'Agent 上下文',
         'Refresh Context': '刷新上下文',
@@ -1693,13 +2130,25 @@ export function dashboardHtml(options = {}) {
         'Refresh MCP Config': '刷新 MCP 配置',
         'Download MCP Config': '下载 MCP 配置',
         'No MCP config loaded': '尚未加载 MCP 配置',
+        'Audit Trail': '审计记录',
+        'Recent events': '最近事件数',
+        'Outcome': '结果',
+        'all': '全部',
+        'success': '成功',
+        'denied': '已拒绝',
+        'error': '错误',
+        'Refresh Audit': '刷新审计记录',
+        'Download NDJSON': '下载 NDJSON',
+        'No audit events loaded': '尚未加载审计事件',
         'Offline Recovery': '离线恢复',
+        'Worker filter': '工作端筛选',
         'Offline worker': '离线工作端',
         'Target worker': '目标工作端',
         'optional target': '可选目标',
-        'Include session tasks': '包含会话任务',
+        'Allow session migration (worker-local workspace may be lost)': '允许迁移会话（工作端本地工作区可能丢失）',
         'Refresh Offline': '刷新离线项',
         'Requeue Offline': '重新排队离线任务',
+        'Recover Tasks': '恢复任务',
         'No offline recovery scan loaded': '尚未加载离线恢复扫描',
         'Submit Task': '提交任务',
         'Session': '会话',
@@ -1763,6 +2212,16 @@ export function dashboardHtml(options = {}) {
         'Use In Forms': '填入表单',
         'Load Events': '加载事件',
         'Metrics': '指标',
+        'Resources': '资源',
+        'CPU utilization': 'CPU 使用率',
+        'Memory available': '可用内存',
+        'Control RTT': '控制面往返延迟',
+        'Control bandwidth': '控制面带宽',
+        'Disk available': '可用磁盘空间',
+        'Temperatures': '温度',
+        'Warming up': '采样中',
+        'Not reported': '未上报',
+        'Not measured': '未测量',
         'Worker Events': '工作端事件',
         'Recent Worker Tasks': '最近工作端任务',
         'Status': '状态',
@@ -1909,6 +2368,7 @@ export function dashboardHtml(options = {}) {
         'drain': '排空',
         'shutdown': '关机',
         'cancel current': '取消当前任务',
+        'rotate token': '轮换令牌',
         'total': '总计',
         'running': '运行中',
         'active': '活跃',
@@ -1944,6 +2404,7 @@ export function dashboardHtml(options = {}) {
       [/^Pruned (\\d+) unused worker enrollment token\\(s\\)$/, '已清理 $1 个未使用工作端接入注册令牌'],
       [/^No unused worker enrollment tokens to prune$/, '没有可清理的未使用接入注册令牌'],
       [/^Loaded worker events for (.+)$/, '已加载 $1 的工作端事件'],
+      [/^Queued worker command (.+) for (.+)$/, (_match, action, workerId) => '已为工作端 ' + workerId + ' 排队命令：' + (activeDictionary()[action] || action)],
       [/^Loaded (\\d+) task events$/, '已加载 $1 条任务事件'],
       [/^Pruned (\\d+) completed task\\(s\\), kept latest (.+)$/, '已清理 $1 个已完成任务，保留最近 $2 个'],
       [/^Pruned (\\d+) system task\\(s\\) and (\\d+) system batch\\(es\\)$/, '已清理 $1 个系统任务和 $2 个系统批次'],
@@ -2303,9 +2764,9 @@ export function dashboardHtml(options = {}) {
 
     function badge(value) {
       const text = String(value || '-');
-      const cls = ['succeeded', 'idle', 'enabled', 'open', 'Ready', 'assigned', 'verified', 'ready'].includes(text) ? 'ok'
+      const cls = ['succeeded', 'idle', 'enabled', 'open', 'owned', 'Ready', 'assigned', 'verified', 'ready', 'Signed Worker token'].includes(text) ? 'ok'
         : ['failed', 'cancelled', 'offline', 'shutdown_requested', 'self-test-failed', 'unavailable'].includes(text) ? 'bad'
-        : ['running', 'queued', 'blocked', 'paused', 'draining', 'completed_with_errors', 'Route Issue', 'unassigned', 'skipped', 'warning', 'configured', 'demo'].includes(text) ? 'warn'
+        : ['running', 'queued', 'blocked', 'paused', 'draining', 'disabled', 'completed_with_errors', 'Route Issue', 'unassigned', 'skipped', 'warning', 'configured', 'demo', 'Unsigned Worker token', 'Administrator credential', 'Unknown identity'].includes(text) ? 'warn'
         : '';
       return '<span class="badge ' + cls + '">' + esc(localizeText(text)) + '</span>';
     }
@@ -2454,6 +2915,26 @@ export function dashboardHtml(options = {}) {
       return Array.isArray(value) && value.length ? value.map(esc).join(', ') : '-';
     }
 
+    function metricBytes(value) {
+      const bytes = Number(value);
+      if (!Number.isFinite(bytes) || bytes < 0) return '-';
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let amount = bytes;
+      let unit = 0;
+      while (amount >= 1024 && unit < units.length - 1) {
+        amount /= 1024;
+        unit += 1;
+      }
+      return (amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)) + units[unit];
+    }
+
+    function metricBandwidth(value) {
+      const bytesPerSecond = Number(value);
+      return Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0
+        ? (Math.round(((bytesPerSecond * 8) / 1000000) * 10) / 10) + ' Mbps'
+        : '-';
+    }
+
     function labels(value) {
       const entries = Object.entries(value || {});
       return entries.length ? entries.map(([key, val]) => esc(key + '=' + val)).join(', ') : '-';
@@ -2472,7 +2953,7 @@ export function dashboardHtml(options = {}) {
         buttons.push('<button data-task-manage="' + esc(task.id) + '" data-task-action="cancel">Cancel</button>');
       }
       if (task.status === 'queued') {
-        if (taskNeedsAttention(task)) {
+        if (taskRoutingIssue(task)) {
           buttons.push('<button data-task-manage="' + esc(task.id) + '" data-task-action="reschedule" data-task-auto-route="true">Auto Route</button>');
         } else {
           buttons.push('<button data-task-manage="' + esc(task.id) + '" data-task-action="reschedule">Reschedule</button>');
@@ -2485,6 +2966,10 @@ export function dashboardHtml(options = {}) {
     }
 
     function taskNeedsAttention(task) {
+      return Boolean(task?.runtimeDiagnostics?.needsAttention) || taskRoutingIssue(task);
+    }
+
+    function taskRoutingIssue(task) {
       if (!task || task.status !== 'queued' || !task.scheduler) {
         return false;
       }
@@ -2510,6 +2995,9 @@ export function dashboardHtml(options = {}) {
     }
 
     function nextActionForTask(task) {
+      if (task?.runtimeDiagnostics?.nextAction) {
+        return task.runtimeDiagnostics.nextAction;
+      }
       if (task?.nextAction) {
         return task.nextAction;
       }
@@ -2551,7 +3039,26 @@ export function dashboardHtml(options = {}) {
         + '<small>' + esc(localizeText(action.message || '')) + '</small></div>';
     }
 
+    function renderRuntimeCell(task) {
+      const runtime = task?.runtimeDiagnostics;
+      if (!runtime) {
+        return '-';
+      }
+      const leaseSeconds = runtime.lease?.remainingMs == null
+        ? ''
+        : ' · ' + Math.round(runtime.lease.remainingMs / 1000) + 's';
+      return '<div class="routing-note">' + badge(localizeText(runtime.state || 'unknown'))
+        + '<small>' + esc(runtime.summary || '-') + esc(leaseSeconds) + '</small></div>';
+    }
+
     function renderRoutingCell(task) {
+      if (task?.runtimeDiagnostics?.needsAttention) {
+        const action = nextActionForTask(task);
+        return '<div class="routing-note">' + badge(localizeText('Runtime Issue'))
+          + '<small>' + esc(task.runtimeDiagnostics.summary || '-')
+          + (action ? '<br>' + esc(localizeText('Next Action')) + ': ' + esc(nextActionLabel(action)) : '')
+          + '</small></div>';
+      }
       if (!task?.scheduler) {
         return '-';
       }
@@ -2652,6 +3159,7 @@ export function dashboardHtml(options = {}) {
       const tools = worker.inventory?.tools || {};
       const probes = [
         { name: 'nvidia-smi', tool: 'nvidiaSmi', available: !!tools.nvidiaSmi?.available, version: tools.nvidiaSmi?.version || null },
+        { name: 'amd-smi', tool: 'amdSmi', available: !!tools.amdSmi?.available, version: tools.amdSmi?.version || null },
         { name: 'rocm-smi', tool: 'rocmSmi', available: !!tools.rocmSmi?.available, version: tools.rocmSmi?.version || null },
       ];
       const advertised = (worker.capabilities || []).includes('gpu');
@@ -2662,7 +3170,7 @@ export function dashboardHtml(options = {}) {
         source: detected ? 'probe' : (advertised ? 'advertised' : 'none'),
         probes,
         warning: advertised && !detected
-          ? 'gpu capability is advertised but no NVIDIA/ROCm probe was reported; verify the worker GPU runtime before scheduling real accelerator workloads'
+          ? 'gpu capability is advertised but no NVIDIA/AMD SMI probe was reported; verify the worker GPU runtime before scheduling real accelerator workloads'
           : '',
       };
     }
@@ -2726,6 +3234,140 @@ export function dashboardHtml(options = {}) {
         + '</div>';
     }
 
+    function topologySource(connection = {}) {
+      const raw = String(connection.remoteAddress || '').trim().toLowerCase();
+      const address = raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+      if (!address || address === 'unknown') {
+        return 'Unknown source';
+      }
+      if (address === '::1' || address === 'localhost' || address.startsWith('127.')) {
+        return 'Loopback source';
+      }
+      if (
+        address.startsWith('10.')
+        || address.startsWith('192.168.')
+        || /^172\.(1[6-9]|2\d|3[01])\./.test(address)
+        || address.startsWith('fc')
+        || address.startsWith('fd')
+        || address.startsWith('fe80:')
+      ) {
+        return 'Private or overlay source';
+      }
+      return 'Public source';
+    }
+
+    function topologyTime(value) {
+      const parsed = Date.parse(value || '');
+      return Number.isFinite(parsed)
+        ? new Date(parsed).toLocaleString(state.locale === 'zh-CN' ? 'zh-CN' : 'en')
+        : '-';
+    }
+
+    function shortRuntimeBuild(build = {}) {
+      return build.buildId || (build.sourceFingerprint ? String(build.sourceFingerprint).slice(0, 23) : '-');
+    }
+
+    function runtimeBuildStatus(controlBuild = {}, workerBuild = {}) {
+      if (!controlBuild.protocolVersion || !workerBuild.protocolVersion) {
+        return { label: 'Build unknown', tone: 'warn' };
+      }
+      if (controlBuild.protocolVersion !== workerBuild.protocolVersion) {
+        return { label: 'Protocol mismatch', tone: 'bad' };
+      }
+      if (controlBuild.sourceFingerprint && workerBuild.sourceFingerprint) {
+        return controlBuild.sourceFingerprint === workerBuild.sourceFingerprint
+          ? { label: 'Build match', tone: 'ok' }
+          : { label: 'Build drift', tone: 'warn' };
+      }
+      if (controlBuild.buildId && workerBuild.buildId) {
+        return controlBuild.buildId === workerBuild.buildId
+          ? { label: 'Build match', tone: 'ok' }
+          : { label: 'Build drift', tone: 'warn' };
+      }
+      return { label: 'Build unknown', tone: 'warn' };
+    }
+
+    function renderCrossSiteTopology(snapshot = state.snapshot) {
+      const target = document.getElementById('crossSiteTopology');
+      if (!target) {
+        return;
+      }
+      if (!snapshot) {
+        target.innerHTML = '<div class="empty">' + esc(localizeText('Waiting for gateway state')) + '</div>';
+        return;
+      }
+      const runtime = snapshot.runtime || {};
+      const controlBuild = runtime.build || {};
+      const storage = snapshot.storage || {};
+      const dataLease = storage.dataLease || {};
+      const receipt = storage.restoreReceipt || null;
+      const workers = [...(snapshot.workers?.items || [])].sort((left, right) => {
+        const leftOnline = left.gatewayState === 'offline' ? 0 : 1;
+        const rightOnline = right.gatewayState === 'offline' ? 0 : 1;
+        return rightOnline - leftOnline || String(left.id).localeCompare(String(right.id));
+      });
+      const controlUrl = state.networkInfo?.preferredRemoteControlUrl
+        || preferredControlUrlCandidate(state.networkInfo)?.url
+        || window.location.origin;
+      const storageVersion = storage.backend === 'sqlite'
+        ? localizeText('State') + ' v' + (storage.stateVersion ?? '-') + ' · ' + localizeText('Schema') + ' v' + (storage.sqliteSchemaVersion ?? '-')
+        : localizeText('State') + ' v' + (storage.stateVersion ?? '-');
+      const restoreHtml = receipt
+        ? '<div class="topology-receipt topology-meta">'
+          + '<b>' + esc(localizeText('Restore receipt')) + '</b> <span class="mono">' + esc(receipt.id || '-') + '</span><br>'
+          + esc(localizeText('Restored')) + ': ' + esc(topologyTime(receipt.restoredAt)) + '<br>'
+          + esc(localizeText('Backup source')) + ': ' + esc(topologyTime(receipt.sourceCreatedAt)) + '<br>'
+          + esc(localizeText('Manifest SHA-256')) + ': <span class="mono">' + esc(receipt.manifestSha256 || '-') + '</span><br>'
+          + esc((receipt.fileCount ?? 0) + ' files · ' + metricBytes(receipt.totalBytes || 0))
+          + '</div>'
+        : '<div class="topology-receipt topology-meta">' + esc(localizeText('No restore receipt; this control is using its original data directory.')) + '</div>';
+      const workerHtml = workers.length
+        ? workers.map((worker) => {
+          const connection = worker.connection || {};
+          const identity = worker.identity || {};
+          const online = worker.gatewayState !== 'offline';
+          const protocol = String(connection.protocol || '-').toUpperCase();
+          const identityLabel = identity.signed
+            ? 'Ed25519 signed'
+            : identity.type === 'admin'
+              ? 'Administrator credential'
+              : identity.type === 'worker_token'
+                ? 'Unsigned Worker token'
+                : 'Unknown identity';
+          const buildStatus = runtimeBuildStatus(controlBuild, worker.runtime?.build || {});
+          return '<div class="topology-worker ' + (online ? 'online' : 'offline') + '">'
+            + '<div class="topology-worker-head"><strong class="mono">' + esc(worker.id) + '</strong>' + badge(worker.gatewayState || 'unknown') + '</div>'
+            + '<div>' + badge(protocol) + ' ' + badge(topologySource(connection)) + ' ' + badge(identityLabel) + ' ' + badge(localizeText(buildStatus.label), buildStatus.tone) + '</div>'
+            + '<div class="topology-meta">'
+            + esc(connection.remoteAddress || '-') + ' · ' + esc(connection.proxyAuthenticated ? localizeText('Authenticated proxy') : localizeText('Direct socket')) + '<br>'
+            + esc(localizeText('Observed')) + ': ' + esc(topologyTime(connection.observedAt || worker.lastSeenAt)) + '<br>'
+            + esc(localizeText('Build')) + ': <span class="mono">' + esc(shortRuntimeBuild(worker.runtime?.build || {})) + '</span><br>'
+            + esc(localizeText('Capabilities')) + ': ' + esc((worker.capabilities || []).join(', ') || '-')
+            + '</div></div>';
+        }).join('')
+        : '<div class="empty">' + esc(localizeText('No workers registered')) + '</div>';
+      target.innerHTML = ''
+        + '<div class="topology-heading">'
+        + '<strong>' + esc(localizeText('Cross-Site Topology')) + '</strong>'
+        + '<small>' + esc(localizeText('Workers initiate outbound poll and heartbeat requests; no Worker inbound port is required.')) + '</small>'
+        + '</div>'
+        + '<div class="topology-flow">'
+        + '<div class="topology-node control">'
+        + badge('VM Control Plane')
+        + '<strong class="mono">' + esc(controlUrl) + '</strong>'
+        + '<div class="topology-meta">'
+        + esc(localizeText('Instance')) + ': <span class="mono">' + esc(runtime.instanceId || '-') + '</span><br>'
+        + esc(localizeText('Started')) + ': ' + esc(topologyTime(runtime.startedAt)) + '<br>'
+        + esc(localizeText('Build')) + ': <span class="mono">' + esc(shortRuntimeBuild(controlBuild)) + '</span> · protocol ' + esc(controlBuild.protocolVersion || '-') + '<br>'
+        + esc(localizeText('Storage')) + ': ' + esc(String(storage.backend || '-').toUpperCase()) + ' · ' + esc(storageVersion) + '<br>'
+        + esc(localizeText('Data lease')) + ': ' + badge(dataLease.enabled ? (dataLease.status || 'unknown') : 'disabled')
+        + (dataLease.writeFencing ? ' · ' + esc(localizeText('write fenced')) : '')
+        + '</div>' + restoreHtml + '</div>'
+        + '<div class="topology-link"><span>' + esc(localizeText('Worker outbound connection')) + '</span></div>'
+        + '<div class="topology-workers">' + workerHtml + '</div>'
+        + '</div>';
+    }
+
     function renderControlReadiness(snapshot = state.snapshot) {
       const target = document.getElementById('readinessStrip');
       if (!target) {
@@ -2738,12 +3380,16 @@ export function dashboardHtml(options = {}) {
       const workers = onlineWorkers(snapshot.workers?.items || []);
       const network = state.networkInfo;
       const preferredUrl = network?.preferredRemoteControlUrl || preferredControlUrlCandidate(network)?.url || '';
-      const networkTone = network?.remoteWorkerReady ? 'ok' : (network ? 'warn' : '');
-      const networkMessage = network
+      const proxyBypass = network?.trustProxyConfigured && !network?.proxyAuthenticated;
+      const networkTone = network?.remoteWorkerReady && !proxyBypass ? 'ok' : (network ? 'warn' : '');
+      const networkMessage = (network
         ? (network.remoteWorkerReady
           ? esc(localizeText('Ready for remote workers')) + '<br><span class="mono">' + esc(preferredUrl) + '</span>'
           : esc(localizeText('Configure public URL for IPv6/LAN workers')) + '<br>' + esc(localizeText('IPv6 literals must use brackets, for example http://[2001:db8::10]:8765')))
-        : esc(localizeText('Scan network URL from Worker Onboarding'));
+        : esc(localizeText('Scan network URL from Worker Onboarding')))
+        + (proxyBypass
+          ? '<br><span class="warn-text">' + esc(localizeText('Current request did not authenticate as the configured reverse proxy; forwarded headers are ignored')) + '</span>'
+          : '');
 
       const agentWorkers = workers.filter((worker) => agentReadiness(worker).readyForAgentTasks !== false && worker.agentCommandConfigured);
       const realAgentWorkers = agentWorkers.filter((worker) => agentReadiness(worker).realTerminalAgent);
@@ -2767,11 +3413,27 @@ export function dashboardHtml(options = {}) {
           ? esc(localizeText('GPU worker advertised only')) + ': <span class="mono">' + esc(advertisedOnlyGpuWorkers.map((worker) => worker.id).join(', ')) + '</span>'
           : esc(localizeText('No GPU worker online')));
 
+      const recovery = snapshot.reliability?.automaticOfflineRecovery || {};
+      const recoveryMessage = recovery.enabled
+        ? esc(localizeText('Enabled for ordinary tasks and same-worker sessions')) + '<br>' + esc(String(recovery.offlineAfterMs || 0) + 'ms · at-least-once')
+        : esc(localizeText('Manual recovery only'));
+
+      const auditSink = snapshot.security?.auditSink || {};
+      const auditIncomplete = auditSink.deliveryIntegrity === 'incomplete';
+      const auditTone = auditSink.state === 'degraded' || auditIncomplete ? 'bad' : auditSink.enabled ? 'ok' : 'warn';
+      const auditMessage = auditSink.state === 'degraded' || auditIncomplete
+        ? esc(localizeText('External audit mirror degraded')) + '<br>' + esc(auditSink.lastErrorCode || 'write_failed')
+        : auditSink.enabled
+          ? esc(localizeText('External audit mirror healthy')) + '<br>' + esc(String(auditSink.writtenEvents || 0) + ' events · ' + String(auditSink.pendingWrites || 0) + '/' + String(auditSink.maxPendingWrites || 0) + ' queued')
+          : esc(localizeText('External audit mirror disabled'));
+
       target.innerHTML = [
         readinessCard('Remote Workers', networkMessage, networkTone),
         readinessCard('Agent Runtime', agentMessage, agentTone),
         readinessCard('GPU Routing', gpuMessage, gpuTone),
         readinessCard('Auto Routing', esc(localizeText('Task text can infer gpu, docs, ppt')), 'ok'),
+        readinessCard('Automatic Recovery', recoveryMessage, recovery.enabled ? 'ok' : 'warn'),
+        readinessCard('Audit Shipping', auditMessage, auditTone),
       ].join('');
     }
 
@@ -2818,9 +3480,47 @@ export function dashboardHtml(options = {}) {
         + '<div class="actions"><button data-worker-agent-self-test="' + esc(worker.id) + '">Run Agent Self-Test</button></div>';
     }
 
+    function renderWorkerIdentity(worker) {
+      const identity = worker.identity || {};
+      const label = identity.signed
+        ? 'Signed Worker token'
+        : identity.type === 'worker_token'
+          ? 'Unsigned Worker token'
+          : identity.type === 'admin'
+            ? 'Administrator credential'
+            : 'Unknown identity';
+      const tokenId = identity.workerTokenId
+        ? '<small class="mono">' + esc(identity.workerTokenId) + '</small>'
+        : '';
+      const clock = Number.isFinite(Number(identity.signatureClockSkewMs))
+        ? '<small>Clock Δ ' + esc(Math.round(Number(identity.signatureClockSkewMs))) + ' ms · signed ' + esc(identity.signatureSignedAt || '-') + '</small>'
+        : '';
+      return '<div>' + badge(label) + tokenId + clock + '</div>';
+    }
+
+    function renderWorkerConnection(worker) {
+      const connection = worker.connection || {};
+      const address = connection.remoteAddress || '-';
+      const route = connection.trustedProxy
+        ? connection.proxyAuthenticated
+          ? 'Authenticated proxy'
+          : 'Unauthenticated proxy evidence'
+        : 'Direct socket';
+      return '<div><span class="mono">' + esc(address) + '</span>'
+        + '<br><small>' + esc(String(connection.protocol || '-').toUpperCase()) + ' · ' + esc(localizeText(route)) + '</small></div>';
+    }
+
     function canForgetWorker(worker) {
       return ['offline', 'shutdown_requested', 'drained'].includes(worker.gatewayState)
         && !(worker.runningTasks || worker.reservedTasks || (worker.currentTaskIds || []).length);
+    }
+
+    function workerManagementActions(worker) {
+      const actions = ['pause', 'resume', 'drain', 'shutdown', 'cancel_current'];
+      if (worker.credentialRotationConfigured) {
+        actions.push('rotate_token');
+      }
+      return actions;
     }
 
     function renderWorkers(workers) {
@@ -2840,6 +3540,8 @@ export function dashboardHtml(options = {}) {
         { label: 'ID', value: (worker) => '<span class="mono">' + esc(worker.id) + '</span>' },
         { label: 'Gateway', value: (worker) => badge(worker.gatewayState) },
         { label: 'Admin', value: (worker) => badge(worker.adminState) },
+        { label: 'Authentication', value: renderWorkerIdentity },
+        { label: 'Source Address', value: renderWorkerConnection },
         { label: 'Slots', value: (worker) => esc((worker.runningSlots || 0) + '/' + (worker.maxConcurrency || 1)) },
         { label: 'Capabilities', value: (worker) => list(worker.capabilities) },
         { label: 'Labels', value: (worker) => labels(worker.labels) },
@@ -2849,7 +3551,7 @@ export function dashboardHtml(options = {}) {
         { label: 'Actions', value: (worker) => '<div class="actions">'
           + '<button data-worker-view="' + esc(worker.id) + '">View</button>'
           + '<button data-worker-use="' + esc(worker.id) + '">Use</button>'
-          + ['pause', 'resume', 'drain', 'shutdown', 'cancel_current'].map((action) => '<button data-worker="' + esc(worker.id) + '" data-action="' + action + '">' + action.replace('_', ' ') + '</button>').join('')
+          + workerManagementActions(worker).map((action) => '<button data-worker="' + esc(worker.id) + '" data-action="' + action + '">' + action.replaceAll('_', ' ') + '</button>').join('')
           + (canForgetWorker(worker) ? '<button data-worker-forget="' + esc(worker.id) + '">Forget</button>' : '')
           + '</div>' },
       ];
@@ -2867,6 +3569,32 @@ export function dashboardHtml(options = {}) {
         .join('\\n') || 'No tool inventory reported';
       const tasks = workerTasks(worker.id).slice(0, 10);
       const agentSelfTest = worker.diagnostics?.agentSelfTest || null;
+      const resources = worker.resources || {};
+      const cpu = resources.cpu || {};
+      const memory = resources.memory || {};
+      const disk = resources.disk || {};
+      const network = resources.network || {};
+      const bandwidth = network.bandwidth || {};
+      const temperatures = resources.temperatures || [];
+      const temperatureText = temperatures.length
+        ? temperatures.map((item) => (item.name || item.source || 'sensor') + ' ' + item.temperatureC + 'C').join(', ')
+        : 'Not reported';
+      const chinese = state.locale === 'zh-CN';
+      const slotUsageText = (worker.runningSlots || 0) + '/' + (worker.maxConcurrency || 1)
+        + (chinese ? ' 已用' : ' used');
+      const cpuDetailText = esc(cpu.logicalCores || 0)
+        + (chinese ? ' 个逻辑核心 · 负载 ' : ' logical cores · load ')
+        + esc(cpu.loadAverage1m ?? '-');
+      const memoryUsageText = memory.usedPercent == null
+        ? '-'
+        : memory.usedPercent + (chinese ? '% 已用' : '% used');
+      const bandwidthText = bandwidth.available
+        ? (chinese ? '下行 ' : 'Down ') + metricBandwidth(bandwidth.downloadBytesPerSecond)
+          + (chinese ? ' / 上行 ' : ' / Up ') + metricBandwidth(bandwidth.uploadBytesPerSecond)
+        : localizeText('Not measured');
+      const diskText = disk.available
+        ? metricBytes(disk.availableBytes) + ' (' + (disk.usedPercent ?? '-') + (chinese ? '% 已用)' : '% used)')
+        : localizeText('Not reported');
       const workerEvents = state.selectedWorkerEvents?.workerId === worker.id
         ? renderEventRows(state.selectedWorkerEvents.events || [])
         : '<div class="empty">Load worker events</div>';
@@ -2875,7 +3603,11 @@ export function dashboardHtml(options = {}) {
         + '<div class="detail-item"><span>ID</span><div class="mono">' + esc(worker.id) + '</div></div>'
         + '<div class="detail-item"><span>Gateway</span>' + badge(worker.gatewayState) + '</div>'
         + '<div class="detail-item"><span>Admin</span>' + badge(worker.adminState) + '</div>'
-        + '<div class="detail-item"><span>Slots</span><div>' + esc((worker.runningSlots || 0) + '/' + (worker.maxConcurrency || 1) + ' used') + '</div></div>'
+        + '<div class="detail-item"><span>Authentication</span>' + renderWorkerIdentity(worker) + '</div>'
+        + '<div class="detail-item"><span>Source Address</span>' + renderWorkerConnection(worker) + '</div>'
+        + '<div class="detail-item"><span>Runtime</span><div class="mono">' + esc(worker.runtime?.id || '-') + '</div><small>PID ' + esc(worker.runtime?.pid || '-') + ' · ' + esc(worker.runtime?.startedAt || '-') + '</small></div>'
+        + '<div class="detail-item"><span>Build</span><div class="mono">' + esc(shortRuntimeBuild(worker.runtime?.build || {})) + '</div><small>' + esc(localizeText(runtimeBuildStatus(state.snapshot?.runtime?.build || {}, worker.runtime?.build || {}).label)) + ' · protocol ' + esc(worker.runtime?.build?.protocolVersion || '-') + '</small></div>'
+        + '<div class="detail-item"><span>Slots</span><div>' + esc(slotUsageText) + '</div></div>'
         + '</div>'
         + '<div class="detail-grid">'
         + '<div class="detail-item"><span>Capabilities</span><div>' + list(worker.capabilities || []) + '</div></div>'
@@ -2885,14 +3617,21 @@ export function dashboardHtml(options = {}) {
         + '<div class="detail-item"><span>Current Tasks</span><div>' + list(worker.currentTaskIds || (worker.currentTaskId ? [worker.currentTaskId] : [])) + '</div></div>'
         + '<div class="detail-item"><span>Last Seen</span><div>' + esc(worker.lastSeenAt || '-') + '</div></div>'
         + '<div class="detail-item"><span>Agent Test</span><div>' + (agentSelfTest ? badge(agentSelfTest.status) + '<br><small>' + esc(agentSelfTest.at || '-') + '</small>' : '-') + '</div></div>'
+        + '<div class="detail-item"><span>CPU utilization</span><div>' + esc(cpu.utilizationPercent == null ? localizeText('Warming up') : cpu.utilizationPercent + '%') + '</div><small>' + cpuDetailText + '</small></div>'
+        + '<div class="detail-item"><span>Memory available</span><div>' + esc(memory.totalBytes ? metricBytes(memory.freeBytes || 0) : localizeText('Not reported')) + '</div><small>' + esc(memoryUsageText) + '</small></div>'
+        + '<div class="detail-item"><span>Control RTT</span><div>' + esc(network.roundTripMs == null ? localizeText('Not measured') : network.roundTripMs + ' ms') + '</div></div>'
+        + '<div class="detail-item"><span>Control bandwidth</span><div>' + esc(bandwidthText) + '</div></div>'
+        + '<div class="detail-item"><span>Disk available</span><div>' + esc(diskText) + '</div></div>'
+        + '<div class="detail-item"><span>Temperatures</span><div>' + esc(localizeText(temperatureText)) + '</div></div>'
         + '</div>'
         + '<div class="actions">'
         + '<button data-worker-use="' + esc(worker.id) + '">Use In Forms</button>'
         + '<button data-worker-events="' + esc(worker.id) + '">Load Events</button>'
         + (worker.agentCommandConfigured ? '<button data-worker-agent-self-test="' + esc(worker.id) + '">Run Agent Self-Test</button>' : '')
-        + ['pause', 'resume', 'drain', 'shutdown', 'cancel_current'].map((action) => '<button data-worker="' + esc(worker.id) + '" data-action="' + action + '">' + action.replace('_', ' ') + '</button>').join('')
+        + workerManagementActions(worker).map((action) => '<button data-worker="' + esc(worker.id) + '" data-action="' + action + '">' + action.replaceAll('_', ' ') + '</button>').join('')
         + (canForgetWorker(worker) ? '<button data-worker-forget="' + esc(worker.id) + '">Forget</button>' : '')
         + '</div>'
+        + '<div class="subhead">Resources</div><pre>' + esc(JSON.stringify(resources || worker.inventory?.resources || {}, null, 2)) + '</pre>'
         + '<div class="subhead">Metrics</div><pre>' + esc(JSON.stringify(worker.metrics || {}, null, 2)) + '</pre>'
         + '<div class="subhead">Tools</div><pre>' + esc(tools) + '</pre>'
         + '<div class="subhead">Worker Events</div><div id="workerEvents">' + workerEvents + '</div>'
@@ -2931,6 +3670,13 @@ export function dashboardHtml(options = {}) {
     }
 
     function renderWorkerTokens(workerTokens) {
+      const tokenStatus = (token) => {
+        if (token.revokedAt) return token.rotationStatus === 'expired' ? 'expired' : 'revoked';
+        if (token.rotationStatus === 'pending') return 'rotation pending';
+        if (token.rotationStatus === 'confirmed') return 'rotated';
+        if (token.expiresAt && Date.parse(token.expiresAt) <= Date.now()) return 'expired';
+        return 'active';
+      };
       document.getElementById('workerTokens').innerHTML = table([
         { label: 'ID', value: (token) => '<span class="mono">' + esc(token.id) + '</span>' },
         { label: 'Worker', value: (token) => esc(token.workerId) },
@@ -2938,7 +3684,12 @@ export function dashboardHtml(options = {}) {
         { label: 'Preview', value: (token) => esc(token.tokenPreview || '-') },
         { label: 'Created', value: (token) => esc(token.createdAt || '-') },
         { label: 'Last Used', value: (token) => esc(token.lastUsedAt || '-') },
-        { label: 'Revoked', value: (token) => token.revokedAt ? badge('revoked') : badge('active') },
+        { label: 'Status', value: (token) => badge(tokenStatus(token)) },
+        { label: 'Rotates From', value: (token) => token.rotationFromTokenId
+          ? '<span class="mono">' + esc(token.rotationFromTokenId) + '</span>'
+          : '-' },
+        { label: 'Rotation Deadline', value: (token) => esc(token.rotationExpiresAt || '-') },
+        { label: 'Confirmed', value: (token) => esc(token.rotationConfirmedAt || '-') },
         { label: 'Actions', value: (token) => token.revokedAt
           ? '-'
           : '<button data-worker-token-revoke="' + esc(token.id) + '">Revoke</button>' },
@@ -3436,6 +4187,340 @@ export function dashboardHtml(options = {}) {
       setStatus('Downloaded gateway manifest');
     }
 
+    function acceptanceRunbookPath() {
+      const params = new URLSearchParams();
+      const workerId = document.getElementById('acceptanceWorker').value.trim() || '<home-worker-id>';
+      const deploymentMode = document.getElementById('acceptanceDeploymentMode').value;
+      const overlayInterface = document.getElementById('acceptanceOverlayInterface').value.trim();
+      params.set('workerId', workerId);
+      params.set('requireGpu', String(document.getElementById('acceptanceRequireGpu').checked));
+      params.set('requireAgent', String(document.getElementById('acceptanceRequireAgent').checked));
+      if (deploymentMode) params.set('deploymentMode', deploymentMode);
+      if (overlayInterface) params.set('overlayInterface', overlayInterface);
+      return '/api/acceptance/runbook?' + params.toString();
+    }
+
+    async function loadAcceptanceRunbook() {
+      if (!tokenInput.value.trim()) {
+        throw new Error('Administrator token is required to load the shared acceptance runbook');
+      }
+      const runbook = await api(acceptanceRunbookPath());
+      state.acceptanceRunbook = runbook;
+      document.getElementById('acceptanceCommand').textContent = runbook.script;
+      renderAcceptanceRunbookProgress();
+      return runbook;
+    }
+
+    function renderAcceptanceCommand() {
+      document.getElementById('acceptanceCommand').textContent = localizeText('Loading acceptance runbook...');
+      loadAcceptanceRunbook().catch((error) => {
+        state.acceptanceRunbook = null;
+        renderAcceptanceRunbookProgress();
+        document.getElementById('acceptanceCommand').textContent = error.message;
+      });
+    }
+
+    const acceptanceReceiptCheckByScenario = {
+      agentCollaboration: 'agentCollaborationReceipt',
+      credentialRevocation: 'credentialRevocationReceipt',
+      remoteCancellation: 'remoteCancellationReceipt',
+      shortDisconnect: 'shortDisconnectReceipt',
+      longDisconnectRecovery: 'longDisconnectRecoveryReceipt',
+      vmRestartRecovery: 'vmRestartRecoveryReceipt',
+      workerRestartRecovery: 'workerRestartRecoveryReceipt',
+      largeArtifactResume: 'largeArtifactResumeReceipt',
+      largeInputResume: 'largeInputResumeReceipt',
+      backupRestore: 'backupRestoreReceipt',
+    };
+
+    const acceptanceCheckCopyZh = {
+      remoteControlUrl: ['存在可供远端工作端连接的非回环控制面 URL', '配置可从家庭网络访问的公网或私网组网 URL'],
+      deploymentBoundaryReceipt: ['严格报告已绑定当前控制面 URL 的有效部署边界回执', '对当前公网或私网组网 URL 运行 deployment check，并载入最新的 deployment-check.json'],
+      agentCollaborationReceipt: ['Agent 协作证据已绑定关闭的亲和会话、两次真实 Agent 尝试和三个产物', '在已验证的终端 Agent 工作端运行 agent-collaboration 验收练习，然后重新生成报告'],
+      encryptedTransport: ['所选工作端实际使用 HTTPS 或经人工核验的加密私网组网', '启用 HTTPS，或记录 Tailscale/WireGuard 的 encryptedPrivateOverlay 证据'],
+      targetWorkerOnline: ['所选家庭工作端在线且管理状态已启用', '启动或恢复所选家庭工作端'],
+      runtimeBuildCompatibility: ['所选工作端与控制面运行相同且协议兼容的构建', '从同一不可变构建重新部署控制面和工作端，重启并等待新的心跳'],
+      targetWorkerRemoteSource: ['控制面从非回环来源地址观测到所选工作端', '让家庭工作端通过 VM 公网或组网 URL 连接；使用代理时正确保留并认证来源地址'],
+      outboundWorkerModel: ['工作端只发起出站请求，无需监听入站端口', '保持家庭工作端仅主动连接控制面'],
+      workerIdentity: ['所选工作端使用最小权限、已签名且可撤销的身份', '使用自助接入包重新注册工作端，并等待已签名心跳'],
+      workerClockSynchronization: ['最新签名请求处于防重放时钟窗口内', '同步 VM 与家庭工作端时钟，重新运行 preflight 并等待新的签名心跳'],
+      credentialRevocationReceipt: ['凭据轮换证据已绑定当前新令牌并证明旧令牌返回 401', '对在线工作端运行 worker manage --action rotate_token --wait --evidence <file>'],
+      remoteCancellationReceipt: ['远程取消证据已绑定目标任务、尝试、取消事件和进程释放结果', '运行 remote-cancellation 验收练习并重新生成报告'],
+      shortDisconnectReceipt: ['短时断网证据证明租约到期前由同一次尝试恢复且只执行一次', '运行 short-disconnect 验收练习，在租约到期前恢复连接'],
+      longDisconnectRecoveryReceipt: ['长时断网证据证明租约恢复、过期结果拒绝和第二次尝试成功', '运行 long-disconnect-recovery，并保持断网直到控制面完成租约恢复'],
+      vmRestartRecoveryReceipt: ['VM 重启证据已绑定控制面实例切换、SQLite 尝试、工作端重连和产物', '运行 vm-restart-recovery，仅重启 VM 控制服务并保留 SQLite 数据卷'],
+      workerRestartRecoveryReceipt: ['家庭工作端重启证据已绑定离线区间、同一身份和新的运行实例', '运行 worker-restart-recovery，等待控制面确认离线后再启动工作端服务'],
+      largeArtifactResumeReceipt: ['大产物证据已绑定持久化偏移、真实停顿、同一上传恢复和 SHA-256', '运行 large-artifact-resume，在已提交部分分块后中断并恢复连接'],
+      largeInputResumeReceipt: ['大输入证据已绑定源摘要、首段与正偏移 Range、断网区间和结果摘要', '运行 large-input-resume，在分段下载期间中断并恢复连接'],
+      backupRestoreReceipt: ['备份恢复证据已绑定校验回执、新旧实例、保留产物和恢复后写入', '运行 backup-restore，恢复到全新目录并验证工作端重新连接'],
+      durableControlStore: ['VM 控制面使用带版本的 SQLite 持久化存储', '将控制面切换到 SQLite 并完成迁移或恢复'],
+      reliabilityConfiguration: ['租约、有限恢复、断点续传与 at-least-once 语义均已启用', '启用 NADO_AUTO_RECOVER_OFFLINE_MS，并核对租约与传输能力标记'],
+      workerResourceTelemetry: ['工作端上报 CPU、内存容量与使用率以及数据卷容量', '等待新的资源心跳并检查工作端事件'],
+      workerNetworkTelemetry: ['工作端上报控制面 RTT 和有限带宽采样', '等待首次心跳与带宽采样周期，然后检查工作端事件'],
+      gpuRuntime: ['GPU 验收要求及实际探测结果符合本次门禁配置', '安装厂商运行时并要求真实 GPU 探测后重新验收'],
+      terminalAgentRuntime: ['真实终端 Agent 已配置并通过自测', '在工作端配置 Codex/Claude，并运行 doctor --agent-self-test'],
+      endToEndVerify: ['目标工作端已通过任务、事件、产物、批次和诊断端到端验证', '勾选运行端到端验证任务后重新运行实时门禁'],
+      physicalSeparation: ['VM 控制面与工作端位于不同物理主机和网络', '在真实 VM/家庭主机上执行 physicalSeparation 场景并记录证据'],
+      outboundOnlyOnboarding: ['家庭工作端接入时未配置路由器端口转发或入站防火墙规则', '在真实双机环境执行 outboundOnlyOnboarding 场景并记录证据'],
+      shortDisconnect: ['短时 WAN 中断在租约到期前由同一次尝试恢复', '在真实双机环境执行 shortDisconnect 场景并记录证据'],
+      longDisconnectRecovery: ['长时 WAN 中断触发租约过期、有限重试并拒绝过期结果', '在真实双机环境执行 longDisconnectRecovery 场景并记录证据'],
+      remoteCancellation: ['VM 发出的取消操作停止了家庭工作端进程并进入终态', '在真实双机环境执行 remoteCancellation 场景并记录证据'],
+      credentialRevocation: ['新凭据可用且被撤销的旧凭据无法再心跳、领取或回报', '在真实双机环境执行 credentialRevocation 场景并记录证据'],
+      vmRestartRecovery: ['控制面重启后保留 SQLite 历史且家庭工作端自动重连', '在真实双机环境执行 vmRestartRecovery 场景并记录证据'],
+      workerRestartRecovery: ['家庭工作端服务离线后以同一签名身份和新运行实例重连', '在真实双机环境执行 workerRestartRecovery 场景并记录证据'],
+      largeArtifactResume: ['被中断的大产物上传恢复后与源 SHA-256 一致', '在真实双机环境执行 largeArtifactResume 场景并记录证据'],
+      largeInputResume: ['被中断的大输入上传和下载恢复后与源 SHA-256 一致', '在真实双机环境执行 largeInputResume 场景并记录证据'],
+      backupRestore: ['已校验备份恢复到全新控制卷，并能完成新的任务', '在真实双机环境执行 backupRestore 场景并记录证据'],
+      agentCollaboration: ['真实终端 Agent 在家庭工作端完成有效协作并返回记录和产物', '在真实双机环境执行 agentCollaboration 场景并记录证据'],
+      encryptedPrivateOverlay: ['非 HTTPS 控制 URL 仅通过受限 ACL 的 Tailscale/WireGuard 承载', '在真实双机环境执行 encryptedPrivateOverlay 场景并记录证据'],
+    };
+
+    function acceptanceCheckCopy(item, field) {
+      if (state.locale !== 'zh-CN') {
+        return item?.[field] || '-';
+      }
+      const copy = acceptanceCheckCopyZh[item?.key];
+      if (!copy) {
+        return item?.[field] || '-';
+      }
+      return field === 'summary' ? copy[0] : copy[1];
+    }
+
+    function acceptanceCheck(report, key) {
+      return [...(report?.automatedChecks || []), ...(report?.manualChecks || [])]
+        .find((item) => item.key === key) || null;
+    }
+
+    function acceptanceRunbookStepState(step) {
+      const report = state.acceptanceReport;
+      if (step.key === 'deployment_boundary') {
+        return acceptanceCheck(report, 'deploymentBoundaryReceipt')?.status
+          || (state.acceptanceDeploymentEvidence ? 'ready' : 'pending');
+      }
+      if (step.key === 'initialize_evidence') {
+        if (!state.acceptanceManualEvidence) return 'pending';
+        return report ? 'passed' : 'ready';
+      }
+      if (step.key === 'strict_report') {
+        return report?.overall || 'not_run';
+      }
+      if (step.scenario) {
+        const receiptKey = acceptanceReceiptCheckByScenario[step.scenario];
+        const validated = acceptanceCheck(report, receiptKey) || acceptanceCheck(report, step.scenario);
+        if (validated) return validated.status;
+        return state.acceptanceManualEvidence?.scenarios?.[step.scenario]?.status || 'pending';
+      }
+      return 'pending';
+    }
+
+    function acceptanceRunbookStepAction(step, status) {
+      if (status === 'passed') return '-';
+      if (step.key === 'deployment_boundary') {
+        if (!state.acceptanceDeploymentEvidence) {
+          return 'Run the deployment check and load deployment-check.json';
+        }
+        return acceptanceCheck(state.acceptanceReport, 'deploymentBoundaryReceipt')?.nextAction
+          || 'Run the live gate to validate the loaded deployment receipt';
+      }
+      if (step.key === 'initialize_evidence') {
+        return state.acceptanceManualEvidence
+          ? 'Run the live gate to validate the loaded evidence document'
+          : 'Load acceptance-evidence.json';
+      }
+      const receiptKey = acceptanceReceiptCheckByScenario[step.scenario];
+      const validated = acceptanceCheck(state.acceptanceReport, receiptKey)
+        || acceptanceCheck(state.acceptanceReport, step.scenario);
+      if (validated?.nextAction) return acceptanceCheckCopy(validated, 'nextAction');
+      if (step.key === 'strict_report') return 'Run the live gate after every preceding step passes';
+      if (step.operatorEditRequired) return 'Replace every placeholder, run the command, and reload the evidence file';
+      return 'Run this runbook step and reload the updated evidence file';
+    }
+
+    function renderAcceptanceRunbookProgress() {
+      const target = document.getElementById('acceptanceRunbookProgress');
+      const runbook = state.acceptanceRunbook;
+      if (!runbook) {
+        target.className = 'empty';
+        target.textContent = localizeText('Load a Worker and evidence files to review runbook progress');
+        return;
+      }
+      const steps = (runbook.steps || []).map((step, index) => {
+        const status = acceptanceRunbookStepState(step);
+        return {
+          ...step,
+          ordinal: index + 1,
+          status,
+          nextAction: acceptanceRunbookStepAction(step, status),
+        };
+      });
+      target.className = '';
+      target.innerHTML = '<div class="subhead">' + esc(localizeText('Runbook Progress')) + '</div>'
+        + table([
+          { label: 'Step', value: (item) => esc(item.ordinal) },
+          { label: 'Check', value: (item) => '<span class="mono">' + esc(item.key) + '</span>' },
+          { label: 'Title', value: (item) => esc(item.title) },
+          { label: 'Status', value: (item) => badge(item.status) },
+          { label: 'Next Action', value: (item) => esc(item.nextAction) },
+        ], steps);
+      applyLocale(target);
+    }
+
+    async function loadAcceptanceJsonFile(inputId, stateKey, statusId, loadedMessage, emptyMessage) {
+      const input = document.getElementById(inputId);
+      const status = document.getElementById(statusId);
+      const file = input.files?.[0] || null;
+      if (!file) {
+        state[stateKey] = null;
+        status.textContent = localizeText(emptyMessage);
+        invalidateAcceptanceReport();
+        return null;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        throw new Error('Acceptance JSON files must be 2 MiB or smaller');
+      }
+      let value;
+      try {
+        value = JSON.parse(await file.text());
+      } catch (error) {
+        throw new Error(file.name + ' is not valid JSON: ' + error.message);
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(file.name + ' must contain a JSON object');
+      }
+      state[stateKey] = value;
+      status.textContent = file.name + ' — ' + localizeText(loadedMessage);
+      invalidateAcceptanceReport();
+      setStatus(file.name + ' loaded for strict acceptance');
+      return value;
+    }
+
+    function bindAcceptanceJsonInput(options) {
+      document.getElementById(options.inputId).addEventListener('change', async () => {
+        try {
+          await loadAcceptanceJsonFile(
+            options.inputId,
+            options.stateKey,
+            options.statusId,
+            options.loadedMessage,
+            options.emptyMessage,
+          );
+        } catch (error) {
+          state[options.stateKey] = null;
+          document.getElementById(options.statusId).textContent = error.message;
+          invalidateAcceptanceReport();
+          setStatus(error.message, true);
+        }
+      });
+    }
+
+    function renderAcceptanceReport(report) {
+      const target = document.getElementById('acceptanceReportResult');
+      if (!report) {
+        target.className = 'empty';
+        target.textContent = localizeText('No live acceptance gate run yet');
+        return;
+      }
+      const checkTable = (checks) => table([
+        { label: 'Check', value: (item) => '<span class="mono">' + esc(item.key) + '</span>' },
+        { label: 'Status', value: (item) => badge(item.status) },
+        { label: 'Required', value: (item) => badge(item.required === false ? 'optional' : 'required') },
+        { label: 'Summary', value: (item) => esc(acceptanceCheckCopy(item, 'summary')) },
+        { label: 'Next Action', value: (item) => esc(item.nextAction ? acceptanceCheckCopy(item, 'nextAction') : '-') },
+      ], checks || []);
+      target.className = '';
+      target.innerHTML = ''
+        + '<div class="detail-grid">'
+        + '<div class="detail-item"><span>Live Gate</span>' + badge(report.overall) + '</div>'
+        + '<div class="detail-item"><span>Worker</span><div class="mono">' + esc(report.requirements?.workerId || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Required Checks</span><div>' + esc(report.summary?.passed + '/' + report.summary?.required) + '</div></div>'
+        + '<div class="detail-item"><span>Failed / Pending</span><div>' + esc((report.summary?.failed || 0) + ' / ' + (report.summary?.pending || 0)) + '</div></div>'
+        + '</div>'
+        + '<div class="subhead">' + esc(localizeText('Automatic Checks')) + '</div>'
+        + checkTable(report.automatedChecks)
+        + '<div class="subhead">' + esc(localizeText('Manual Evidence')) + '</div>'
+        + checkTable(report.manualChecks)
+        + '<div class="subhead">' + esc(localizeText('Next Actions')) + '</div>'
+        + table([
+          { label: 'Check', value: (item) => '<span class="mono">' + esc(item.key) + '</span>' },
+          { label: 'Next Action', value: (item) => esc(acceptanceCheckCopy(item, 'action')) },
+        ], report.nextActions || []);
+      applyLocale(target);
+      renderAcceptanceRunbookProgress();
+    }
+
+    function invalidateAcceptanceReport() {
+      state.acceptanceReport = null;
+      document.getElementById('downloadAcceptanceReport').disabled = true;
+      renderAcceptanceReport(null);
+      renderAcceptanceRunbookProgress();
+    }
+
+    async function runAcceptanceGate() {
+      const workerId = document.getElementById('acceptanceWorker').value.trim();
+      if (!workerId) {
+        throw new Error('Home Worker is required');
+      }
+      setStatus('Running live cross-site gate...');
+      const report = await api('/api/acceptance/report', {
+        method: 'POST',
+        body: JSON.stringify({
+          workerId,
+          requireGpu: document.getElementById('acceptanceRequireGpu').checked,
+          requireAgent: document.getElementById('acceptanceRequireAgent').checked,
+          requireDeploymentEvidence: true,
+          deploymentEvidence: state.acceptanceDeploymentEvidence,
+          manualEvidence: state.acceptanceManualEvidence || {},
+          runVerify: document.getElementById('acceptanceRunVerify').checked,
+          timeoutMs: Number(document.getElementById('acceptanceTimeout').value || 60_000),
+        }),
+      });
+      state.acceptanceReport = report;
+      renderAcceptanceReport(report);
+      document.getElementById('downloadAcceptanceReport').disabled = false;
+      setStatus('Live acceptance gate ' + report.overall + ': ' + report.summary.passed + '/' + report.summary.required + ' checks passed', report.overall === 'failed');
+      return report;
+    }
+
+    function downloadAcceptanceReport() {
+      if (!state.acceptanceReport) {
+        throw new Error('No live acceptance report available');
+      }
+      downloadBlob('nado-live-acceptance-report.json', new Blob([
+        JSON.stringify(state.acceptanceReport, null, 2) + '\\n',
+      ], { type: 'application/json' }));
+      setStatus('Downloaded live acceptance report');
+    }
+
+    async function downloadAcceptanceEvidence() {
+      const template = await api('/api/acceptance/template');
+      downloadBlob('acceptance-evidence.json', new Blob([
+        JSON.stringify(template, null, 2) + '\\n',
+      ], { type: 'application/json' }));
+      renderAcceptanceCommand();
+      setStatus('Downloaded cross-site acceptance evidence template');
+    }
+
+    async function copyAcceptanceCommand() {
+      const text = (await loadAcceptanceRunbook()).script;
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand('copy');
+        textarea.remove();
+        if (!copied) {
+          throw new Error('Clipboard copy failed');
+        }
+      }
+      setStatus('Copied shared cross-site acceptance runbook');
+    }
+
     function mcpConfigPath() {
       const params = new URLSearchParams();
       const name = document.getElementById('mcpConfigName').value.trim();
@@ -3485,6 +4570,43 @@ export function dashboardHtml(options = {}) {
       setStatus('Downloaded MCP config');
     }
 
+    function auditQuery() {
+      const params = new URLSearchParams();
+      params.set('tail', String(Math.max(1, Math.min(1000, Number(document.getElementById('auditTail').value || 100)))));
+      const outcome = document.getElementById('auditOutcome').value;
+      if (outcome) params.set('outcome', outcome);
+      return params.toString();
+    }
+
+    async function loadAuditTrail() {
+      const { auditEvents } = await api('/api/audit?' + auditQuery());
+      const rows = [...(auditEvents || [])].reverse();
+      const target = document.getElementById('auditTrail');
+      target.className = rows.length ? '' : 'empty';
+      target.innerHTML = rows.length ? table([
+        { label: 'At', value: (event) => esc(event.at || '-') },
+        { label: 'Actor', value: (event) => esc(event.actorType + ':' + (event.actorId || '-')) },
+        { label: 'Request', value: (event) => '<span class="mono">' + esc(event.requestId || '-') + '</span>' },
+        { label: 'Method', value: (event) => esc(event.method || '-') },
+        { label: 'Path', value: (event) => '<span class="mono">' + esc(event.path || '-') + '</span>' },
+        { label: 'Status', value: (event) => badge(event.outcome || event.statusCode) },
+      ], rows) : 'No audit events found';
+      setStatus('Loaded ' + rows.length + ' audit event(s)');
+    }
+
+    async function downloadAuditTrail() {
+      const response = await fetch('/api/audit/export?' + auditQuery(), {
+        headers: {
+          accept: 'application/x-ndjson',
+          authorization: 'Bearer ' + tokenInput.value.trim(),
+        },
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(text || response.statusText);
+      downloadBlob('nado-audit.ndjson', new Blob([text], { type: 'application/x-ndjson' }));
+      setStatus('Downloaded audit trail');
+    }
+
     function recoveryOptions(action) {
       const form = document.getElementById('recoveryForm');
       const data = new FormData(form);
@@ -3521,7 +4643,9 @@ export function dashboardHtml(options = {}) {
         { label: 'Status', value: (item) => badge(item.task?.status || '-') },
         { label: 'Worker', value: (item) => esc(item.worker?.id || item.task?.assignedWorkerId || '-') },
         { label: 'Gateway', value: (item) => badge(item.worker?.gatewayState || 'offline') },
+        { label: 'Reason', value: (item) => esc(item.recoveryReason || 'worker_offline') },
         { label: 'Offline', value: (item) => item.offlineMs == null ? '-' : esc(Math.round(item.offlineMs / 1000) + 's') },
+        { label: 'Lease expired', value: (item) => item.leaseExpiredMs == null ? '-' : esc(Math.round(item.leaseExpiredMs / 1000) + 's') },
         { label: 'Session', value: (item) => esc(item.task?.sessionId || '-') },
         { label: 'Title', value: (item) => esc(item.task?.title || item.task?.id || '-') },
         { label: 'Actions', value: (item) => item.task?.id ? '<button data-task-view="' + esc(item.task.id) + '">Task</button>' : '-' },
@@ -3538,7 +4662,7 @@ export function dashboardHtml(options = {}) {
       const { candidates } = await api('/api/recovery/offline-tasks' + suffix);
       renderRecoveryCandidates(candidates);
       if (!silent) {
-        setStatus('Loaded ' + candidates.length + ' offline recovery candidates');
+        setStatus('Loaded ' + candidates.length + ' recoverable tasks');
       }
     }
 
@@ -3549,7 +4673,8 @@ export function dashboardHtml(options = {}) {
       });
       renderRecoveryCandidates(result.candidates || []);
       const skipped = result.skipped?.length || 0;
-      setStatus('Recovered ' + result.recovered.length + ' offline tasks' + (skipped ? ', skipped ' + skipped : ''));
+      const exhausted = (result.exhausted || []).length;
+      setStatus('Recovered ' + result.recovered.length + ' tasks' + (exhausted ? ', exhausted ' + exhausted : '') + (skipped ? ', skipped ' + skipped : ''));
       await refresh();
     }
 
@@ -3573,9 +4698,24 @@ export function dashboardHtml(options = {}) {
 
     function filteredTasks(tasks) {
       const newestFirst = [...(tasks || [])].sort((a, b) => taskTime(b) - taskTime(a));
-      return state.taskFilter === 'all'
+      const scoped = state.taskFilter === 'all'
         ? newestFirst
         : newestFirst.filter((task) => !isSystemTask(task));
+      const query = String(state.taskSearch || '').trim().toLowerCase();
+      if (!query) {
+        return scoped;
+      }
+      return scoped.filter((task) => [
+        task.id,
+        task.title,
+        task.status,
+        task.assignedWorkerId,
+        task.requestedWorkerId,
+        task.scheduler?.workerId,
+        task.scheduler?.reason,
+        ...(task.requiredCapabilities || []),
+        ...(task.requiredTools || []),
+      ].filter(Boolean).join(' ').toLowerCase().includes(query));
     }
 
     function updateTaskFilterControls(total, shown) {
@@ -3588,6 +4728,11 @@ export function dashboardHtml(options = {}) {
         hint.dataset.i18nStatus = label + ' (' + shown + '/' + total + ')';
         hint.textContent = localizeText(label) + ' (' + shown + '/' + total + ')';
       }
+      document.querySelectorAll('[data-task-search]').forEach((input) => {
+        if (input.value !== state.taskSearch) {
+          input.value = state.taskSearch;
+        }
+      });
     }
 
     async function pruneTaskHistory(options = {}) {
@@ -3674,6 +4819,7 @@ export function dashboardHtml(options = {}) {
       const columns = compact ? [
         { label: 'Status', value: (task) => badge(task.status) },
         { label: 'Worker', value: (task) => taskWorkerDisplay(task) },
+        { label: 'Runtime', value: (task) => renderRuntimeCell(task) },
         { label: 'Routing', value: (task) => renderRoutingCell(task) },
         { label: 'Title', value: (task) => esc(task.title) },
         { label: 'Actions', value: (task) => taskActionButtons(task, true) },
@@ -3681,6 +4827,7 @@ export function dashboardHtml(options = {}) {
         { label: 'ID', value: (task) => '<span class="mono">' + esc(task.id) + '</span>' },
         { label: 'Status', value: (task) => badge(task.status) },
         { label: 'Worker', value: (task) => taskWorkerDisplay(task) },
+        { label: 'Runtime', value: (task) => renderRuntimeCell(task) },
         { label: 'Routing', value: (task) => renderRoutingCell(task) },
         { label: 'Priority', value: (task) => esc(task.priority || 0) },
         { label: 'Slots', value: (task) => esc(task.slots || 1) },
@@ -3698,18 +4845,20 @@ export function dashboardHtml(options = {}) {
         return;
       }
       if (cancelButton) {
-        cancelButton.disabled = rows.length === 0;
-        cancelButton.textContent = localizeText('Cancel Issues') + (rows.length ? ' (' + rows.length + ')' : '');
+        const routingIssueCount = rows.filter(taskRoutingIssue).length;
+        cancelButton.disabled = routingIssueCount === 0;
+        cancelButton.textContent = localizeText('Cancel Issues') + (routingIssueCount ? ' (' + routingIssueCount + ')' : '');
       }
       target.className = rows.length ? '' : 'empty';
       target.innerHTML = rows.length ? table([
         { label: 'Status', value: (task) => badge(task.status) },
         { label: 'Worker', value: (task) => taskWorkerDisplay(task) },
+        { label: 'Runtime', value: (task) => renderRuntimeCell(task) },
         { label: 'Routing', value: (task) => renderRoutingCell(task) },
         { label: 'Next Action', value: (task) => renderNextAction(task) },
         { label: 'Title', value: (task) => esc(task.title) },
         { label: 'Actions', value: (task) => taskActionButtons(task) },
-      ], rows) : 'No routing issues';
+      ], rows) : 'No task issues';
     }
 
     function renderEventRows(events) {
@@ -3751,7 +4900,23 @@ export function dashboardHtml(options = {}) {
         .join('  ');
     }
 
+    function renderConsoleProgress(taskId = null, task = null) {
+      const stages = [...document.querySelectorAll('[data-console-stage]')];
+      if (!stages.length) {
+        return;
+      }
+      const status = task?.status || '';
+      const terminal = ['succeeded', 'failed', 'cancelled'].includes(status);
+      const current = !taskId ? 0 : (!task ? 1 : (terminal ? 3 : 2));
+      stages.forEach((stage, index) => {
+        stage.classList.toggle('active', index === current && !terminal);
+        stage.classList.toggle('done', index < current || (terminal && index === current && status === 'succeeded'));
+        stage.classList.toggle('bad', terminal && index === current && status !== 'succeeded');
+      });
+    }
+
     function renderConsoleOutput(taskId, events = [], task = null, artifactPreview = '') {
+      renderConsoleProgress(taskId, task);
       const target = document.getElementById('consoleOutput');
       const downloadButton = document.getElementById('downloadConsoleArtifacts');
       const lines = [];
@@ -4360,6 +5525,34 @@ export function dashboardHtml(options = {}) {
         ], scheduler.candidates || []);
     }
 
+    function renderTaskRuntime(task) {
+      const runtime = task?.runtimeDiagnostics;
+      if (!runtime) {
+        return '<div class="empty">No runtime diagnostics available</div>';
+      }
+      const action = runtime.nextAction;
+      const remaining = runtime.lease?.remainingMs == null
+        ? '-'
+        : Math.round(runtime.lease.remainingMs / 1000) + 's';
+      const workerHealth = runtime.worker
+        ? (runtime.worker.gatewayState || 'unknown') + ' · age=' + (runtime.worker.ageMs == null ? '-' : Math.round(runtime.worker.ageMs / 1000) + 's')
+        : '-';
+      return '<div class="detail-grid">'
+        + '<div class="detail-item"><span>State</span><div>' + badge(localizeText(runtime.state || 'unknown')) + '</div></div>'
+        + '<div class="detail-item"><span>Attempt ID</span><div class="mono">' + esc(runtime.attemptId || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Worker Health</span><div>' + esc(workerHealth) + '</div></div>'
+        + '<div class="detail-item"><span>Lease Remaining</span><div>' + esc(remaining) + '</div></div>'
+        + '<div class="detail-item"><span>Lease Renewed</span><div>' + esc(runtime.lease?.renewedAt || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Lease Expires</span><div>' + esc(runtime.lease?.expiresAt || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Session Worker</span><div>' + esc(runtime.session?.assignedWorkerId || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Session Workspace</span><div class="mono">' + esc(runtime.session?.workspace || '-') + '</div></div>'
+        + '<div class="detail-item wide"><span>Summary</span><div>' + esc(runtime.summary || '-') + '</div></div>'
+        + (action
+          ? '<div class="detail-item wide"><span>Next Action</span><div><strong>' + esc(nextActionLabel(action)) + '</strong><br>' + esc(localizeText(action.message || '')) + '</div></div>'
+          : '')
+        + '</div>';
+    }
+
     function renderTaskDetail(task, artifacts, artifactPreview = '') {
       document.getElementById('taskDetail').innerHTML = ''
         + '<div class="detail-grid">'
@@ -4367,7 +5560,13 @@ export function dashboardHtml(options = {}) {
         + '<div class="detail-item"><span>Status</span>' + badge(task.status) + '</div>'
         + '<div class="detail-item"><span>Worker</span><div>' + esc(task.assignedWorkerId || task.requestedWorkerId || '-') + '</div></div>'
         + '<div class="detail-item"><span>Exit</span><div>' + esc(task.exitCode ?? '-') + '</div></div>'
+        + '<div class="detail-item"><span>Failure Kind</span><div>' + esc(task.failureKind || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Attempts</span><div>' + esc((task.attemptSeq || 0) + '/' + (task.maxAttempts || 3)) + '</div></div>'
+        + '<div class="detail-item"><span>Retry Policy</span><div class="mono">' + esc(JSON.stringify(task.retryPolicy || {})) + '</div></div>'
+        + '<div class="detail-item"><span>Next Retry</span><div>' + esc(task.notBeforeAt || '-') + '</div></div>'
+        + '<div class="detail-item"><span>Resources</span><div class="mono">' + esc(JSON.stringify(task.requiredResources || {})) + '</div></div>'
         + '</div>'
+        + '<div class="subhead">Runtime</div>' + renderTaskRuntime(task)
         + '<div class="subhead">Scheduler</div>' + renderScheduler(task)
         + '<div class="subhead">Manage Task</div>'
         + '<form id="taskManageForm" class="form-grid" data-task-id="' + esc(task.id) + '">'
@@ -4714,7 +5913,7 @@ export function dashboardHtml(options = {}) {
     }
 
     async function cancelRoutingIssues() {
-      const tasks = filteredTasks(state.snapshot?.tasks?.items || []).filter(taskNeedsAttention);
+      const tasks = filteredTasks(state.snapshot?.tasks?.items || []).filter(taskRoutingIssue);
       if (!tasks.length) {
         setStatus('No routing issues');
         return;
@@ -5158,6 +6357,9 @@ export function dashboardHtml(options = {}) {
       document.getElementById('sessionWorkerId').value = workerId;
       document.getElementById('recoveryTargetWorker').value = workerId;
       document.getElementById('workerTokenFilter').value = workerId;
+      document.getElementById('acceptanceWorker').value = workerId;
+      renderAcceptanceCommand();
+      invalidateAcceptanceReport();
       updateConsoleRoutingSummary();
       setStatus('Using worker ' + workerId + ' in forms');
     }
@@ -5246,11 +6448,12 @@ export function dashboardHtml(options = {}) {
         button.addEventListener('click', async () => {
           try {
             button.disabled = true;
-            await api('/api/workers/' + encodeURIComponent(button.dataset.worker) + '/manage', {
+            const result = await api('/api/workers/' + encodeURIComponent(button.dataset.worker) + '/manage', {
               method: 'POST',
               body: JSON.stringify({ action: button.dataset.action, reason: 'dashboard' }),
             });
             state.selectedWorkerId = button.dataset.worker;
+            setStatus('Queued worker command ' + button.dataset.action.replaceAll('_', ' ') + ' for ' + result.worker.id);
             await refresh();
           } catch (error) {
             setStatus(error.message, true);
@@ -5290,7 +6493,7 @@ export function dashboardHtml(options = {}) {
       if (has('#submitForm')) return ['tasks'];
       if (has('#plannerForm') || has('#batchPlanForm') || has('#batchForm') || has('#batches') || has('#batchDetail')) return ['batches'];
       if (has('#sessionForm') || has('#sessions') || has('#sessionDetail')) return ['sessions'];
-      if (has('#doctorForm') || has('#verifyForm') || has('#agentContext') || has('#capabilitiesManifest') || has('#mcpConfig') || has('#recoveryForm')) return ['ops'];
+      if (has('#doctorForm') || has('#verifyForm') || has('#acceptanceForm') || has('#agentContext') || has('#capabilitiesManifest') || has('#mcpConfig') || has('#recoveryForm')) return ['ops'];
       return ['ops'];
     }
 
@@ -5347,6 +6550,7 @@ export function dashboardHtml(options = {}) {
     function render(snapshot) {
       renderStats(snapshot);
       renderControlReadiness(snapshot);
+      renderCrossSiteTopology(snapshot);
       renderConsoleAgentNotice(snapshot.workers.items || []);
       renderWorkers(snapshot.workers.items || []);
       renderAttentionTasks(snapshot.tasks.items || []);
@@ -5375,6 +6579,19 @@ export function dashboardHtml(options = {}) {
       if (!text) return {};
       const [key, ...rest] = text.split('=');
       return key ? { [key]: rest.join('=') || 'true' } : {};
+    }
+
+    function requiredResourcesFromForm(form) {
+      const resources = {
+        platform: form.get('resourcePlatform') || undefined,
+        arch: form.get('resourceArch') || undefined,
+        cpuCores: form.get('resourceCpu') || undefined,
+        memory: form.get('resourceMemory') || undefined,
+        gpuCount: form.get('resourceGpuCount') || undefined,
+        gpuMemory: form.get('resourceVram') || undefined,
+        gpuModel: form.get('resourceGpuModel') || undefined,
+      };
+      return Object.values(resources).some(Boolean) ? resources : undefined;
     }
 
     function parseEnvText(value) {
@@ -5463,13 +6680,97 @@ export function dashboardHtml(options = {}) {
     async function readInputFiles(fileList) {
       const files = Array.from(fileList || []);
       const inputFiles = [];
+      let inlineBytes = 0;
+      const inlineFileLimit = 5 * 1024 * 1024;
+      const inlineTotalLimit = 20 * 1024 * 1024;
       for (const file of files) {
+        const inputPath = file.webkitRelativePath || file.name;
+        const inline = file.size <= inlineFileLimit && inlineBytes + file.size <= inlineTotalLimit;
+        if (!inline) {
+          if (!globalThis.crypto?.subtle) {
+            throw new Error('Large browser inputs require HTTPS (or localhost) for chunk hashing; use the CLI on plain HTTP');
+          }
+          inputFiles.push({
+            path: inputPath,
+            size: file.size,
+            transfer: 'chunked',
+            digestMode: 'server',
+            browserFile: file,
+          });
+          continue;
+        }
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        inlineBytes += file.size;
         inputFiles.push({
-          path: file.webkitRelativePath || file.name,
-          contentBase64: bytesToBase64(new Uint8Array(await file.arrayBuffer())),
+          path: inputPath,
+          size: file.size,
+          contentBase64: bytesToBase64(bytes),
         });
       }
       return inputFiles;
+    }
+
+    function digestHex(buffer) {
+      return Array.from(new Uint8Array(buffer)).map((value) => value.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function uploadDashboardInput(task, item) {
+      const descriptor = (task.inputFiles || []).find((file) => (
+        file.inputUploadId && file.path === item.path && Number(file.size) === Number(item.size)
+      ));
+      if (!descriptor) {
+        throw new Error('Task did not create an input upload slot for ' + item.path);
+      }
+      const chunkBytes = 4 * 1024 * 1024;
+      let status = await api('/api/tasks/' + encodeURIComponent(task.id) + '/input-uploads/' + encodeURIComponent(descriptor.inputUploadId));
+      let offset = Number(status.upload.committedBytes || 0);
+      let failures = 0;
+      while (offset < item.browserFile.size) {
+        const end = Math.min(item.browserFile.size, offset + chunkBytes);
+        const chunk = await item.browserFile.slice(offset, end).arrayBuffer();
+        const sha256 = digestHex(await crypto.subtle.digest('SHA-256', chunk));
+        let response;
+        try {
+          response = await fetch('/api/tasks/' + encodeURIComponent(task.id)
+            + '/input-uploads/' + encodeURIComponent(descriptor.inputUploadId)
+            + '/chunks?offset=' + offset, {
+            method: 'PATCH',
+            headers: {
+              ...headers(),
+              'content-type': 'application/octet-stream',
+              'x-nado-chunk-sha256': sha256,
+            },
+            body: chunk,
+          });
+        } catch {
+          response = null;
+        }
+        if (!response?.ok) {
+          status = await api('/api/tasks/' + encodeURIComponent(task.id) + '/input-uploads/' + encodeURIComponent(descriptor.inputUploadId));
+          const committed = Number(status.upload.committedBytes || 0);
+          if (committed === offset) {
+            failures += 1;
+            if (failures >= 5) {
+              const message = response ? await response.text() : 'network request failed';
+              throw new Error('Input upload failed for ' + item.path + ': ' + message);
+            }
+            await delay(Math.min(4000, 250 * (2 ** (failures - 1))));
+            continue;
+          }
+          offset = committed;
+          failures = 0;
+          continue;
+        }
+        const uploaded = await response.json();
+        offset = Number(uploaded.upload.committedBytes || 0);
+        failures = 0;
+        setStatus('Uploading ' + item.path + ': ' + offset + '/' + item.browserFile.size);
+      }
+      await api('/api/tasks/' + encodeURIComponent(task.id)
+        + '/input-uploads/' + encodeURIComponent(descriptor.inputUploadId) + '/finalize', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
     }
 
     function artifactPolicyFromForm(form) {
@@ -5684,6 +6985,7 @@ export function dashboardHtml(options = {}) {
       maybeAutoFillInviteControl(info);
       renderNetworkInfo(info);
       renderControlReadiness();
+      renderCrossSiteTopology();
       if (!silent) {
         setStatus('Network URLs refreshed');
       }
@@ -5705,6 +7007,7 @@ export function dashboardHtml(options = {}) {
         agentPreset: form.get('agentPreset') || '',
         agentCommand: form.get('agentCommand') || '',
         maxConcurrency: Number(form.get('maxConcurrency') || 1),
+        strictLocalReadiness: Boolean(form.get('strictLocalReadiness')),
         cleanupWorkspaces: Boolean(form.get('cleanupWorkspaces')),
         pollMs: Number(form.get('pollMs') || 2000),
         dataDir: form.get('dataDir') || '.nado',
@@ -5763,6 +7066,7 @@ export function dashboardHtml(options = {}) {
           agentPreset: options.agentPreset,
           agentCommand: options.agentCommand,
           maxConcurrency: options.maxConcurrency,
+          strictLocalReadiness: options.strictLocalReadiness,
           cleanupWorkspaces: options.cleanupWorkspaces,
           pollMs: options.pollMs,
           dataDir: options.dataDir,
@@ -5825,6 +7129,8 @@ export function dashboardHtml(options = {}) {
       localStorage.setItem('nadoLocale', state.locale);
       applyLocale();
       updateConsoleRoutingSummary();
+      renderControlReadiness();
+      renderCrossSiteTopology();
     });
     document.querySelectorAll('[data-view-tab]').forEach((button) => {
       button.addEventListener('click', () => {
@@ -5843,6 +7149,22 @@ export function dashboardHtml(options = {}) {
           renderTasks(state.snapshot.tasks.items || []);
           bindTaskDetailButtons();
           bindTaskManageButtons();
+          applyLocale(document.getElementById('tasks')?.closest('section') || document.body);
+        }
+      });
+    });
+    document.querySelectorAll('[data-task-search]').forEach((input) => {
+      input.value = state.taskSearch;
+      input.addEventListener('input', () => {
+        state.taskSearch = input.value;
+        localStorage.setItem('nadoTaskSearch', state.taskSearch);
+        if (state.snapshot) {
+          renderAttentionTasks(state.snapshot.tasks.items || []);
+          renderTasks(state.snapshot.tasks.items || []);
+          bindTaskDetailButtons(document.getElementById('attentionTasks'));
+          bindTaskDetailButtons(document.getElementById('tasks'));
+          bindTaskManageButtons(document.getElementById('attentionTasks'));
+          bindTaskManageButtons(document.getElementById('tasks'));
           applyLocale(document.getElementById('tasks')?.closest('section') || document.body);
         }
       });
@@ -5870,12 +7192,12 @@ export function dashboardHtml(options = {}) {
       document.getElementById(id).addEventListener('change', updateConsoleRoutingSummary);
     });
     updateConsoleRoutingSummary();
+    renderConsoleProgress();
     applyView();
     if (!document.getElementById('inviteId').value.trim()) {
       document.getElementById('inviteId').value = generatedWorkerId();
     }
     document.getElementById('saveToken').addEventListener('click', () => {
-      localStorage.setItem('nadoToken', tokenInput.value.trim());
       refresh().catch((error) => setStatus(error.message, true));
     });
     document.getElementById('refresh').addEventListener('click', () => {
@@ -5959,6 +7281,74 @@ export function dashboardHtml(options = {}) {
         document.getElementById('runVerify').disabled = false;
       }
     });
+    document.getElementById('acceptanceWorker').addEventListener('input', () => {
+      renderAcceptanceCommand();
+      invalidateAcceptanceReport();
+    });
+    document.getElementById('acceptanceRequireGpu').addEventListener('change', () => {
+      renderAcceptanceCommand();
+      invalidateAcceptanceReport();
+    });
+    document.getElementById('acceptanceRequireAgent').addEventListener('change', () => {
+      renderAcceptanceCommand();
+      invalidateAcceptanceReport();
+    });
+    document.getElementById('acceptanceDeploymentMode').addEventListener('change', () => {
+      renderAcceptanceCommand();
+      invalidateAcceptanceReport();
+    });
+    document.getElementById('acceptanceOverlayInterface').addEventListener('input', () => {
+      renderAcceptanceCommand();
+      invalidateAcceptanceReport();
+    });
+    document.getElementById('acceptanceRunVerify').addEventListener('change', invalidateAcceptanceReport);
+    document.getElementById('acceptanceTimeout').addEventListener('input', invalidateAcceptanceReport);
+    bindAcceptanceJsonInput({
+      inputId: 'acceptanceDeploymentEvidence',
+      stateKey: 'acceptanceDeploymentEvidence',
+      statusId: 'acceptanceDeploymentEvidenceStatus',
+      loadedMessage: 'Deployment receipt loaded; run the live gate to validate it',
+      emptyMessage: 'No deployment receipt loaded',
+    });
+    bindAcceptanceJsonInput({
+      inputId: 'acceptanceManualEvidence',
+      stateKey: 'acceptanceManualEvidence',
+      statusId: 'acceptanceManualEvidenceStatus',
+      loadedMessage: 'Evidence loaded; run the live gate to validate it',
+      emptyMessage: 'No evidence document loaded',
+    });
+    document.getElementById('runAcceptanceGate').addEventListener('click', async () => {
+      const button = document.getElementById('runAcceptanceGate');
+      try {
+        button.disabled = true;
+        await runAcceptanceGate();
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+    document.getElementById('downloadAcceptanceReport').addEventListener('click', () => {
+      try {
+        downloadAcceptanceReport();
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    });
+    document.getElementById('copyAcceptanceCommand').addEventListener('click', () => {
+      copyAcceptanceCommand().catch((error) => setStatus(error.message, true));
+    });
+    document.getElementById('downloadAcceptanceEvidence').addEventListener('click', async () => {
+      try {
+        document.getElementById('downloadAcceptanceEvidence').disabled = true;
+        await downloadAcceptanceEvidence();
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        document.getElementById('downloadAcceptanceEvidence').disabled = false;
+      }
+    });
+    renderAcceptanceCommand();
     document.getElementById('runDemoHealth').addEventListener('click', async () => {
       try {
         document.getElementById('runDemoHealth').disabled = true;
@@ -6006,6 +7396,19 @@ export function dashboardHtml(options = {}) {
         setStatus(error.message, true);
       } finally {
         document.getElementById('downloadMcpConfig').disabled = false;
+      }
+    });
+    document.getElementById('loadAuditTrail').addEventListener('click', () => {
+      loadAuditTrail().catch((error) => setStatus(error.message, true));
+    });
+    document.getElementById('downloadAuditTrail').addEventListener('click', async () => {
+      try {
+        document.getElementById('downloadAuditTrail').disabled = true;
+        await downloadAuditTrail();
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        document.getElementById('downloadAuditTrail').disabled = false;
       }
     });
     document.getElementById('loadRecoveryCandidates').addEventListener('click', () => {
@@ -6107,10 +7510,18 @@ export function dashboardHtml(options = {}) {
     });
     document.getElementById('submitForm').addEventListener('submit', async (event) => {
       event.preventDefault();
-      const form = new FormData(event.currentTarget);
+      const formElement = event.currentTarget;
+      const form = new FormData(formElement);
       const taskType = form.get('type') || 'shell';
       const command = String(form.get('command') || '').trim();
       const prompt = String(form.get('prompt') || '').trim();
+      let selectedInputs;
+      try {
+        selectedInputs = await readInputFiles(document.getElementById('inputFiles').files);
+      } catch (error) {
+        setStatus(error.message, true);
+        return;
+      }
       const body = {
         title: form.get('title') || command || prompt || 'dashboard task',
         type: taskType,
@@ -6121,15 +7532,23 @@ export function dashboardHtml(options = {}) {
         requiredCapabilities: parseCsv(form.get('capability')),
         requiredTools: parseCsv(form.get('tool')),
         requiredLabels: parseLabel(form.get('label')),
+        requiredResources: requiredResourcesFromForm(form),
         priority: Number(form.get('priority') || 0),
         slots: Number(form.get('slots') || 1),
         timeoutMs: form.get('timeoutMs') ? Number(form.get('timeoutMs')) : undefined,
+        maxAttempts: form.get('maxAttempts') ? Number(form.get('maxAttempts')) : undefined,
+        retryPolicy: {
+          failureKinds: parseCsv(form.get('retryFailureKinds')),
+          exitCodes: parseCsv(form.get('retryExitCodes')).map((value) => Number(value)),
+        },
+        retryBackoffMs: form.get('retryBackoffMs') ? Number(form.get('retryBackoffMs')) : undefined,
+        maxRetryBackoffMs: form.get('maxRetryBackoffMs') ? Number(form.get('maxRetryBackoffMs')) : undefined,
         keepWorkspace: keepWorkspaceFromPolicy(form.get('workspacePolicy')),
         sandboxProfile: form.get('sandboxProfile') || undefined,
         env: parseEnvText(form.get('envText')),
         artifactPolicy: artifactPolicyFromForm(form),
         requireRoutable: Boolean(form.get('requireRoutable')),
-        inputFiles: await readInputFiles(document.getElementById('inputFiles').files),
+        inputFiles: selectedInputs.map(({ browserFile, ...file }) => file),
       };
       if (taskType === 'shell' && !body.command) {
         setStatus('Shell tasks require a command', true);
@@ -6144,7 +7563,10 @@ export function dashboardHtml(options = {}) {
           method: 'POST',
           body: JSON.stringify(body),
         });
-        event.currentTarget.reset();
+        for (const item of selectedInputs.filter((input) => input.browserFile)) {
+          await uploadDashboardInput(result.task, item);
+        }
+        formElement.reset();
         document.getElementById('taskType').value = 'shell';
         document.getElementById('priority').value = '0';
         document.getElementById('slots').value = '1';
@@ -6264,13 +7686,15 @@ export function dashboardHtml(options = {}) {
     });
     document.getElementById('sessionForm').addEventListener('submit', async (event) => {
       event.preventDefault();
-      const form = new FormData(event.currentTarget);
+      const formElement = event.currentTarget;
+      const form = new FormData(formElement);
       const body = {
         title: form.get('title') || 'dashboard session',
         workerId: form.get('workerId') || undefined,
         requiredCapabilities: parseCsv(form.get('capability')),
         requiredTools: parseCsv(form.get('tool')),
         requiredLabels: parseLabel(form.get('label')),
+        requiredResources: requiredResourcesFromForm(form),
       };
       try {
         const result = await api('/api/sessions', {
@@ -6279,7 +7703,7 @@ export function dashboardHtml(options = {}) {
         });
         state.selectedSessionId = result.session.id;
         document.getElementById('sessionId').value = result.session.id;
-        event.currentTarget.reset();
+        formElement.reset();
         setStatus('Created session ' + result.session.id);
         await refresh();
       } catch (error) {

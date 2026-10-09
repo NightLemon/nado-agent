@@ -80,6 +80,22 @@ test('worker runtime events are durable and visible from HTTP client and CLI', a
       'event-worker',
       (event) => event.type === 'registered' && event.message.includes('event-worker'),
     );
+    const runtimeStarted = await waitForWorkerEvent(
+      client,
+      'event-worker',
+      (event) => event.type === 'runtime_started' && event.data?.controlObserved === true,
+    );
+    const runtimeEvent = runtimeStarted.events.find((event) => event.type === 'runtime_started');
+    assert.equal(runtimeEvent.data.runtimeId, runtimeStarted.worker.runtime.id);
+    assert.equal(runtimeEvent.data.previousRuntimeId, null);
+    await assert.rejects(
+      () => client.addWorkerEvent('event-worker', {
+        type: 'runtime_started',
+        message: 'forged runtime transition',
+        data: { controlObserved: true, runtimeId: 'forged' },
+      }),
+      (error) => error.status === 400 && /reserved for control-observed events/.test(error.message),
+    );
 
     const created = await client.createTask({
       title: 'worker event task',
@@ -137,6 +153,84 @@ test('worker runtime events are durable and visible from HTTP client and CLI', a
       await worker.done;
     }
     await new Promise((resolve) => server.close(resolve));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('retried Worker evidence is idempotent and its task correlation survives a SQLite restart', async () => {
+  const root = await makeTempDir();
+  const dataDir = path.join(root, 'control');
+  const token = 'worker-event-correlation-token';
+  let running = await startControlServer({
+    host: '127.0.0.1',
+    port: 0,
+    token,
+    dataDir,
+    storeBackend: 'sqlite',
+  });
+
+  try {
+    let client = new NadoClient({
+      controlUrl: `http://127.0.0.1:${running.port}`,
+      token,
+    });
+    await running.store.upsertWorker({
+      id: 'correlation-worker',
+      name: 'correlation-worker',
+      capabilities: ['code'],
+      maxConcurrency: 1,
+    });
+    const created = await client.createTask({
+      title: 'correlate retried Worker evidence',
+      type: 'shell',
+      workerId: 'correlation-worker',
+      command: 'node -e "setTimeout(() => {}, 1000)"',
+    });
+    const claimed = await running.store.claimTask('correlation-worker');
+    const attemptId = claimed.currentAttemptId;
+    await client.manageTask(created.task.id, 'cancel', { reason: 'event correlation test' });
+
+    const release = {
+      id: 'wev_release_idempotency_test',
+      type: 'task_released',
+      message: 'released correlated task process',
+      data: { taskId: created.task.id, attemptId },
+    };
+    await client.addWorkerEvent('correlation-worker', release);
+    await client.addWorkerEvent('correlation-worker', release);
+
+    const beforeRestart = await client.getTask(created.task.id);
+    const durableBeforeRestart = beforeRestart.task.events.filter((event) => (
+      event.type === 'worker_process_released'
+      && event.attemptId === attemptId
+    ));
+    assert.equal(durableBeforeRestart.length, 1);
+    assert.equal(durableBeforeRestart[0].data.workerEventId, release.id);
+    const workerEvents = await client.listWorkerEvents('correlation-worker');
+    assert.equal(workerEvents.events.filter((event) => event.id === release.id).length, 1);
+
+    await new Promise((resolve) => running.server.close(resolve));
+    running = await startControlServer({
+      host: '127.0.0.1',
+      port: 0,
+      token,
+      dataDir,
+      storeBackend: 'sqlite',
+    });
+    client = new NadoClient({
+      controlUrl: `http://127.0.0.1:${running.port}`,
+      token,
+    });
+    const afterRestart = await client.getTask(created.task.id);
+    assert.equal(afterRestart.task.events.filter((event) => (
+      event.type === 'worker_process_released'
+      && event.attemptId === attemptId
+      && event.data?.workerEventId === release.id
+    )).length, 1);
+  } finally {
+    if (running.server.listening) {
+      await new Promise((resolve) => running.server.close(resolve));
+    }
     await fs.rm(root, { recursive: true, force: true });
   }
 });

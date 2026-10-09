@@ -30,18 +30,21 @@ export async function readJson(file, fallback) {
   }
 }
 
-export async function writeJson(file, data) {
+export async function writeJson(file, data, options = {}) {
   await ensureDir(path.dirname(file));
   const tmp = `${file}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   await fs.writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
   try {
+    await options.beforeCommit?.();
     await fs.rename(tmp, file);
   } catch (error) {
     if (process.platform === 'win32' && (error.code === 'EPERM' || error.code === 'EEXIST')) {
+      await options.beforeCommit?.();
       await fs.rm(file, { force: true });
       await fs.rename(tmp, file);
       return;
     }
+    await fs.rm(tmp, { force: true }).catch(() => {});
     throw error;
   }
 }

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "demo": "node ./src/demo.js",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=8",
     "quickstart": "node ./src/cli.js quickstart",
     "mcp": "node ./src/cli.js mcp",
     "start:control": "node ./src/cli.js control start",

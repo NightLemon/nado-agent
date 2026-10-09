@@ -1,9 +1,26 @@
+import crypto from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
-const DEFAULT_MAX_TOTAL_BYTES = 20 * 1024 * 1024;
+const DEFAULT_INLINE_FILE_BYTES = 5 * 1024 * 1024;
+const DEFAULT_INLINE_TOTAL_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 50 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_FILES = 500;
+
+function positiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+async function sha256File(file) {
+  const hash = crypto.createHash('sha256');
+  for await (const chunk of createReadStream(file)) {
+    hash.update(chunk);
+  }
+  return hash.digest('hex');
+}
 
 function shouldSkip(relativePath) {
   const parts = relativePath.split(/[\\/]/);
@@ -21,7 +38,8 @@ async function walk(dir, root, files) {
     if (entry.isDirectory()) {
       await walk(fullPath, root, files);
     } else if (entry.isFile()) {
-      files.push({ fullPath, relativePath });
+      const stat = await fs.stat(fullPath);
+      files.push({ fullPath, relativePath, size: stat.size });
     }
   }
 }
@@ -43,9 +61,23 @@ function resolveInputPath(value, baseDir) {
 }
 
 export async function collectLocalInputFiles(input, options = {}) {
-  const maxFileBytes = Number(options.maxInputFileBytes || DEFAULT_MAX_FILE_BYTES);
-  const maxTotalBytes = Number(options.maxInputTotalBytes || DEFAULT_MAX_TOTAL_BYTES);
-  const maxFiles = Number(options.maxInputFiles || DEFAULT_MAX_FILES);
+  const maxFileBytes = positiveNumber(
+    options.maxInputFileBytes ?? process.env.NADO_INPUT_MAX_FILE_BYTES,
+    DEFAULT_MAX_FILE_BYTES,
+  );
+  const maxTotalBytes = positiveNumber(
+    options.maxInputTotalBytes ?? process.env.NADO_INPUT_MAX_TOTAL_BYTES,
+    DEFAULT_MAX_TOTAL_BYTES,
+  );
+  const inlineFileBytes = positiveNumber(
+    options.inlineInputFileBytes ?? process.env.NADO_INPUT_INLINE_MAX_BYTES,
+    DEFAULT_INLINE_FILE_BYTES,
+  );
+  const inlineTotalBytes = positiveNumber(
+    options.inlineInputTotalBytes ?? process.env.NADO_INPUT_INLINE_TOTAL_BYTES,
+    DEFAULT_INLINE_TOTAL_BYTES,
+  );
+  const maxFiles = positiveNumber(options.maxInputFiles, DEFAULT_MAX_FILES);
   const baseDir = options.baseDir || '.';
   const candidates = [];
 
@@ -65,6 +97,7 @@ export async function collectLocalInputFiles(input, options = {}) {
 
   const output = [];
   let totalBytes = 0;
+  let inlineBytes = 0;
   for (const candidate of candidates.sort((a, b) => a.relativePath.localeCompare(b.relativePath))) {
     if (output.length >= maxFiles) {
       throw new Error(`Too many input files; limit is ${maxFiles}`);
@@ -79,10 +112,25 @@ export async function collectLocalInputFiles(input, options = {}) {
       throw new Error(`Input files exceed total size limit of ${maxTotalBytes} bytes`);
     }
     totalBytes += candidate.size;
+    const inline = candidate.size <= inlineFileBytes
+      && inlineBytes + candidate.size <= inlineTotalBytes;
+    if (inline) {
+      const bytes = await fs.readFile(candidate.fullPath);
+      inlineBytes += candidate.size;
+      output.push({
+        path: candidate.relativePath,
+        size: candidate.size,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        contentBase64: bytes.toString('base64'),
+      });
+      continue;
+    }
     output.push({
       path: candidate.relativePath,
       size: candidate.size,
-      contentBase64: (await fs.readFile(candidate.fullPath)).toString('base64'),
+      sha256: await sha256File(candidate.fullPath),
+      localPath: candidate.fullPath,
+      transfer: 'chunked',
     });
   }
 

@@ -138,6 +138,10 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_doctor'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_capabilities'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_verify'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'nado_acceptance_template'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'nado_acceptance_runbook'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'nado_record_acceptance_evidence'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'nado_acceptance_report'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_demo_health'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_manage_worker'));
     assert.ok(tools.tools.some((tool) => tool.name === 'nado_create_session'));
@@ -194,6 +198,8 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.ok(Array.isArray(submitTaskTool.inputSchema.properties.dependencyArtifacts.oneOf));
     assert.deepEqual(submitTaskTool.inputSchema.properties.sandboxProfile.enum, ['default', 'isolated']);
     assert.equal(submitTaskTool.inputSchema.properties.requireRoutable.type, 'boolean');
+    assert.equal(submitTaskTool.inputSchema.properties.requiredResources.properties.platform.type, 'string');
+    assert.equal(submitTaskTool.inputSchema.properties.requiredResources.properties.arch.type, 'string');
     const runTaskTool = tools.tools.find((tool) => tool.name === 'nado_run_task');
     assert.equal(runTaskTool.inputSchema.properties.waitTimeoutMs.type, 'number');
     assert.equal(runTaskTool.inputSchema.properties.includeArtifactContent.type, 'boolean');
@@ -213,6 +219,28 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.equal(demoHealthTool.inputSchema.properties.skipVerify.type, 'boolean');
     assert.equal(demoHealthTool.inputSchema.properties.noPrune.type, 'boolean');
     assert.equal(demoHealthTool.inputSchema.properties.timeoutMs.type, 'number');
+    const acceptanceTemplateTool = tools.tools.find((tool) => tool.name === 'nado_acceptance_template');
+    assert.deepEqual(acceptanceTemplateTool.inputSchema.properties, {});
+    const acceptanceRunbookTool = tools.tools.find((tool) => tool.name === 'nado_acceptance_runbook');
+    assert.deepEqual(acceptanceRunbookTool.inputSchema.required, ['workerId']);
+    assert.deepEqual(acceptanceRunbookTool.inputSchema.properties.deploymentMode.enum, ['public_https', 'tailscale', 'wireguard']);
+    const acceptanceEvidenceTool = tools.tools.find((tool) => tool.name === 'nado_record_acceptance_evidence');
+    assert.deepEqual(acceptanceEvidenceTool.inputSchema.required, ['record']);
+    assert.deepEqual(acceptanceEvidenceTool.inputSchema.properties.record.required, ['scenario', 'status']);
+    const acceptanceReportTool = tools.tools.find((tool) => tool.name === 'nado_acceptance_report');
+    assert.deepEqual(acceptanceReportTool.inputSchema.required, ['workerId']);
+    assert.equal(acceptanceReportTool.inputSchema.properties.requireGpu.type, 'boolean');
+    assert.equal(acceptanceReportTool.inputSchema.properties.requireAgent.type, 'boolean');
+    assert.equal(acceptanceReportTool.inputSchema.properties.runVerify.type, 'boolean');
+    assert.equal(acceptanceReportTool.inputSchema.properties.requireDeploymentEvidence.type, 'boolean');
+    assert.equal(acceptanceReportTool.inputSchema.properties.requireDeploymentEvidence.default, true);
+    assert.equal(acceptanceReportTool.inputSchema.properties.deploymentEvidence.type, 'object');
+    assert.equal(acceptanceReportTool.inputSchema.properties.manualEvidence.type, 'object');
+    assert.equal(
+      acceptanceReportTool.inputSchema.properties.manualEvidence.properties.scenarios
+        .additionalProperties.properties.description.type,
+      'string',
+    );
     const doctorTool = tools.tools.find((tool) => tool.name === 'nado_doctor');
     assert.equal(doctorTool.inputSchema.properties.agentSelfTest.type, 'boolean');
 
@@ -363,12 +391,14 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
         labels: { zone: 'mcp' },
         includeContent: false,
         maxUses: 4,
+        strictLocalReadiness: true,
         bundleControlUrl: controlUrl,
       },
     }));
     assert.equal(bootstrapBundle.manifest.name, 'nado-worker-bootstrap-bundle');
     assert.equal(bootstrapBundle.manifest.controlUrl, controlUrl);
     assert.equal(bootstrapBundle.manifest.enrollment.workerIdAssignedByControl, true);
+    assert.equal(bootstrapBundle.manifest.strictLocalReadiness, true);
     assert.match(bootstrapBundle.enrollmentToken.id, /^wenroll_/);
     assert.equal(bootstrapBundle.bundleRoot, 'nado-worker-bootstrap');
     assert.match(bootstrapBundle.fileName, /nado-worker-bootstrap\.zip/);
@@ -457,15 +487,20 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.equal(capabilities.controlUrl, controlUrl);
     assert.equal(capabilities.surfaces.dashboard, `${controlUrl}/dashboard`);
     assert.equal(capabilities.features.demoHealth, true);
+    assert.deepEqual(capabilities.features.workerServiceInstallers, ['systemd', 'windows_scheduled_task', 'macos_launch_agent']);
     assert.equal(capabilities.features.ipv6ControlUrls, true);
     assert.equal(capabilities.features.networkActionHints, true);
     assert.equal(capabilities.features.trustedProxyHeaders, true);
     assert.equal(capabilities.features.workerResourceDiagnostics, true);
+    assert.equal(capabilities.features.platformArchitectureScheduling, true);
     assert.equal(capabilities.features.workerReadinessDiagnostics, true);
     assert.deepEqual(capabilities.features.autoCapabilityRouting, ['gpu', 'docs', 'ppt']);
     assert.equal(capabilities.networking.publicControlUrlEnv, 'NADO_PUBLIC_CONTROL_URL');
     assert.equal(capabilities.networking.trustProxyEnv, 'NADO_TRUST_PROXY');
     assert.equal(capabilities.networking.diagnosticsNextActionField, 'network.nextAction');
+    assert.equal(capabilities.networking.deploymentCheck.receiptVersion, 2);
+    assert.equal(capabilities.networking.deploymentCheck.strictAcceptanceRequired, true);
+    assert.equal(capabilities.networking.deploymentCheck.liveControlContainerHardeningEvidence, true);
     assert.ok(capabilities.routingPolicy.automaticInference.some(
       (policy) => policy.capability === 'gpu' && policy.rules.includes('CUDA keyword'),
     ));
@@ -473,8 +508,15 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.equal(capabilities.routingPolicy.resourcePreference.preserveGpuCapacityWhenGpuNotRequired, true);
     assert.equal(capabilities.routingPolicy.resourcePreference.preferProbeDetectedGpuWhenGpuRequired, true);
     assert.equal(capabilities.endpoints.demoHealth, 'POST /api/demo/health');
+    assert.ok(capabilities.cli.examples.some(
+      (example) => example.includes('--require-complete') && example.includes('--deployment-evidence'),
+    ));
     assert.ok(capabilities.mcp.tools.includes('nado_capabilities'));
     assert.ok(capabilities.mcp.tools.includes('nado_network'));
+    assert.ok(capabilities.mcp.tools.includes('nado_acceptance_template'));
+    assert.ok(capabilities.mcp.tools.includes('nado_acceptance_runbook'));
+    assert.ok(capabilities.mcp.tools.includes('nado_record_acceptance_evidence'));
+    assert.ok(capabilities.mcp.tools.includes('nado_acceptance_report'));
     assert.ok(capabilities.mcp.tools.includes('nado_demo_health'));
     assert.ok(capabilities.mcp.tools.includes('nado_list_worker_enrollment_tokens'));
     assert.ok(capabilities.workers.some((workerSummary) => workerSummary.id === 'mcp-worker'));
@@ -497,6 +539,94 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.equal(demoHealth.prune, null);
     assert.equal(demoHealth.routeChecks.find((check) => check.capability === 'docs').workerId, 'mcp-worker');
     assert.equal(demoHealth.routeChecks.find((check) => check.capability === 'gpu').status, 'skipped');
+
+    const acceptanceTemplate = jsonFromTool(await mcp.request('tools/call', {
+      name: 'nado_acceptance_template',
+      arguments: {},
+    }));
+    assert.equal(acceptanceTemplate.version, 1);
+    assert.equal(acceptanceTemplate.scenarios.physicalSeparation.status, 'pending');
+    assert.match(acceptanceTemplate.scenarios.physicalSeparation.description, /different physical hosts/);
+
+    const acceptanceRunbook = jsonFromTool(await mcp.request('tools/call', {
+      name: 'nado_acceptance_runbook',
+      arguments: {
+        workerId: 'mcp-worker',
+        deploymentMode: 'public_https',
+        requireAgent: false,
+      },
+    }));
+    assert.equal(acceptanceRunbook.runbookVersion, 2);
+    assert.equal(acceptanceRunbook.workerId, 'mcp-worker');
+    assert.equal(acceptanceRunbook.steps.some((item) => item.key === 'agent_collaboration'), false);
+    assert.ok(acceptanceRunbook.steps.some((item) => item.key === 'credential_revocation'));
+
+    const acceptanceEvidence = jsonFromTool(await mcp.request('tools/call', {
+      name: 'nado_record_acceptance_evidence',
+      arguments: {
+        document: acceptanceTemplate,
+        record: {
+          scenario: 'physicalSeparation',
+          status: 'passed',
+          note: 'VM and home Worker observed on different networks',
+          references: ['operator/network-topology.txt'],
+        },
+      },
+    }));
+    assert.equal(acceptanceEvidence.scenarios.physicalSeparation.status, 'passed');
+    assert.equal(acceptanceEvidence.scenarios.agentCollaboration.status, 'pending');
+
+    const acceptanceReport = jsonFromTool(await mcp.request('tools/call', {
+      name: 'nado_acceptance_report',
+      arguments: {
+        workerId: 'mcp-worker',
+        requireAgent: false,
+        manualEvidence: acceptanceEvidence,
+        deploymentEvidence: {
+          reportVersion: 2,
+          ok: true,
+          mode: 'public_https',
+          generatedAt: new Date().toISOString(),
+          publicControlUrl: 'https://mcp-evidence.invalid',
+          checks: [],
+        },
+      },
+    }));
+    assert.equal(acceptanceReport.requirements.workerId, 'mcp-worker');
+    assert.equal(acceptanceReport.requirements.requireAgent, false);
+    assert.equal(acceptanceReport.requirements.requireDeploymentEvidence, true);
+    assert.equal(acceptanceReport.overall, 'failed');
+    const deploymentBoundaryReceipt = acceptanceReport.automatedChecks
+      .find((check) => check.key === 'deploymentBoundaryReceipt');
+    assert.equal(deploymentBoundaryReceipt.status, 'failed');
+    assert.equal(deploymentBoundaryReceipt.evidence.observedControlUrl, 'https://mcp-evidence.invalid');
+    assert.equal(
+      acceptanceReport.manualChecks.find((check) => check.key === 'physicalSeparation').status,
+      'passed',
+    );
+    assert.equal(
+      acceptanceReport.automatedChecks.find((check) => check.key === 'targetWorkerRemoteSource').status,
+      'failed',
+    );
+    assert.equal(
+      acceptanceReport.automatedChecks.find((check) => check.key === 'endToEndVerify').status,
+      'pending',
+    );
+
+    const diagnosticAcceptanceReport = jsonFromTool(await mcp.request('tools/call', {
+      name: 'nado_acceptance_report',
+      arguments: {
+        workerId: 'mcp-worker',
+        requireAgent: false,
+        requireDeploymentEvidence: false,
+        manualEvidence: acceptanceEvidence,
+      },
+    }));
+    assert.equal(diagnosticAcceptanceReport.requirements.requireDeploymentEvidence, false);
+    assert.equal(
+      diagnosticAcceptanceReport.automatedChecks.some((check) => check.key === 'deploymentBoundaryReceipt'),
+      false,
+    );
 
     const doctor = jsonFromTool(await mcp.request('tools/call', {
       name: 'nado_doctor',
@@ -547,6 +677,7 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
         tools: ['node'],
         slots: 1,
         labels: { zone: 'mcp' },
+        requiredResources: { platform: process.platform, arch: process.arch },
         priority: 3,
         keepWorkspace: true,
         sandboxProfile: 'isolated',
@@ -558,10 +689,15 @@ test('MCP tools expose gateway worker discovery, dispatch, and task waiting', as
     assert.equal(labeledTask.task.sandboxProfile, 'isolated');
     assert.equal(labeledTask.task.env.MCP_ENV, 'from-mcp');
     assert.deepEqual(labeledTask.task.requiredTools, ['node']);
+    assert.deepEqual(labeledTask.task.requiredResources, { platform: process.platform, arch: process.arch });
     assert.equal(labeledTask.task.slots, 1);
     assert.equal(labeledTask.routing.taskId, labeledTask.task.id);
     assert.equal(labeledTask.routing.selectedWorkerId, 'mcp-worker');
-    assert.equal(labeledTask.routing.reason, 'scheduled by score 135');
+    const selectedRouteCandidate = labeledTask.routing.candidates.find((candidate) => (
+      candidate.workerId === labeledTask.routing.selectedWorkerId
+    ));
+    assert.ok(selectedRouteCandidate);
+    assert.equal(labeledTask.routing.reason, `scheduled by score ${selectedRouteCandidate.score}`);
     assert.deepEqual(labeledTask.routing.effectiveRequiredCapabilities, []);
     assert.ok(labeledTask.routing.candidates.some((candidate) => (
       candidate.workerId === 'mcp-worker'

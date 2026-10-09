@@ -66,6 +66,7 @@ export function buildWorkerInvite({
   cleanupWorkspaces = false,
   pollMs = null,
   dataDir = '.nado',
+  buildId = null,
   format = 'bash',
 }) {
   if (!token) {
@@ -94,6 +95,7 @@ export function buildWorkerInvite({
       '# Run from the nado-agent repository root on the worker host.',
       `$env:NADO_TOKEN=${quotePowerShell(token)}`,
       `$env:NADO_CONTROL=${quotePowerShell(controlUrl)}`,
+      ...(buildId ? [`$env:NADO_BUILD_ID=${quotePowerShell(buildId)}`] : []),
       buildWorkerPreflightCommand({ id, dataDir, format }, quotePowerShell),
       `node .\\src\\cli.js worker start ${options}`,
     ].join('\n');
@@ -117,6 +119,7 @@ export function buildWorkerInvite({
     '# Run from the nado-agent repository root on the worker host.',
     `export NADO_TOKEN=${quoteBash(token)}`,
     `export NADO_CONTROL=${quoteBash(controlUrl)}`,
+    ...(buildId ? [`export NADO_BUILD_ID=${quoteBash(buildId)}`] : []),
     buildWorkerPreflightCommand({ id, dataDir, format }, quoteBash),
     `node ./src/cli.js worker start ${options}`,
   ].join('\n');

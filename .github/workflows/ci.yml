@@ -34,12 +34,31 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    env:
+      NADO_TOKEN: local-ci-token
+      NADO_PUBLIC_CONTROL_URL: https://nado.example.com
+      NADO_DOMAIN: nado.example.com
+      NADO_TRUST_PROXY_SECRET: local-ci-proxy-secret
     steps:
       - uses: actions/checkout@v5
-      - name: Validate production compose
-        env:
-          NADO_TOKEN: local-ci-token
-          NADO_PUBLIC_CONTROL_URL: https://nado.example.com
-        run: docker compose -f docker-compose.azure.yml config
-      - name: Build image
-        run: docker build -t nado-agent:ci .
+      - name: Validate Compose definitions
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.azure.yml config --quiet
+          docker compose -f docker-compose.azure.yml -f docker-compose.azure-https.yml config --quiet
+      - name: Validate Caddy configuration
+        run: |
+          docker run --rm \
+            -e NADO_DOMAIN \
+            -e NADO_TRUST_PROXY_SECRET \
+            -v "$PWD/deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2.10-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Compile Azure Bicep template
+        run: |
+          az bicep install --version v0.46.1
+          az bicep build --file deploy/azure/main.bicep --stdout >/dev/null
+      - name: Build Control and Worker images
+        run: |
+          docker build --target control -t nado-agent-control:ci .
+          docker build --target worker -t nado-agent-worker:ci .

@@ -25,6 +25,15 @@ test('control server serves a durable authenticated dashboard shell', async () =
     const response = await fetch(`${controlUrl}/dashboard`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('content-type'), /text\/html/);
+    assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(response.headers.get('x-frame-options'), 'DENY');
+    assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const contentSecurityPolicy = response.headers.get('content-security-policy');
+    assert.match(contentSecurityPolicy, /script-src 'nonce-[^']+'/);
+    assert.match(contentSecurityPolicy, /style-src 'nonce-[^']+'/);
+    assert.match(contentSecurityPolicy, /object-src 'none'/);
+    assert.match(contentSecurityPolicy, /frame-ancestors 'none'/);
     const html = await response.text();
     assert.match(html, /Nado Control/);
     assert.match(html, /aria-label="NADO_TOKEN"/);
@@ -34,10 +43,25 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /工作端接入/);
     assert.match(html, /readinessStrip/);
     assert.match(html, /renderControlReadiness/);
+    assert.match(html, /crossSiteTopology/);
+    assert.match(html, /renderCrossSiteTopology/);
+    assert.match(html, /Cross-Site Topology/);
+    assert.match(html, /VM Control Plane/);
+    assert.match(html, /runtime\.instanceId/);
+    assert.match(html, /storage\.sqliteSchemaVersion/);
+    assert.match(html, /storage\.restoreReceipt/);
+    assert.match(html, /storage\.dataLease/);
+    assert.match(html, /write fenced/);
+    assert.match(html, /receipt\.manifestSha256/);
+    assert.match(html, /connection\.remoteAddress/);
+    assert.match(html, /identity\.signed/);
+    assert.match(html, /identity\.type === 'admin'/);
+    assert.match(html, /Workers initiate outbound poll and heartbeat requests/);
     assert.match(html, /Remote Workers/);
     assert.match(html, /Verified terminal agent ready/);
     assert.match(html, /IPv6 literals must use brackets/);
     assert.match(html, /GPU worker advertised only/);
+    assert.match(html, /amdSmi/);
     assert.match(html, /Task text can infer gpu, docs, ppt/);
     assert.match(html, /view-tabs/);
     assert.match(html, /data-view-tab="workbench"/);
@@ -49,7 +73,7 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /applyView/);
     assert.match(html, /nadoDashboardView/);
     assert.match(html, /DASHBOARD_UI_VERSION/);
-    assert.match(html, /workbench-access-tab-v1/);
+    assert.match(html, /cross-site-ops-v3/);
     assert.match(html, /DASHBOARD_VIEWS/);
     assert.match(html, /nadoDashboardUiVersion/);
     assert.match(html, /initialDashboardView/);
@@ -138,13 +162,54 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /capabilities inferred=/);
     assert.match(html, /No console task artifacts available/);
     assert.match(html, /Worker Tokens/);
+    assert.match(html, /nado worker token rotate/);
+    assert.match(html, /rotation pending/);
+    assert.match(html, /Rotation Deadline/);
     assert.match(html, /Doctor/);
     assert.match(html, /Readiness Verify/);
+    assert.match(html, /Cross-Site Acceptance/);
+    assert.match(html, /acceptanceWorker/);
+    assert.match(html, /acceptanceRequireGpu/);
+    assert.match(html, /acceptanceDeploymentMode/);
+    assert.match(html, /acceptanceOverlayInterface/);
+    assert.match(html, /acceptanceDeploymentEvidence/);
+    assert.match(html, /acceptanceManualEvidence/);
+    assert.match(html, /acceptanceRunbookProgress/);
+    assert.match(html, /renderAcceptanceRunbookProgress/);
+    assert.match(html, /loadAcceptanceJsonFile/);
+    assert.match(html, /requireDeploymentEvidence: true/);
+    assert.match(html, /deploymentEvidence: state\.acceptanceDeploymentEvidence/);
+    assert.match(html, /manualEvidence: state\.acceptanceManualEvidence/);
+    assert.match(html, /downloadAcceptanceEvidence/);
+    assert.match(html, /已下载跨站点验收证据模板/);
+    assert.match(html, /renderAcceptanceCommand/);
+    assert.match(html, /acceptanceCommand'\)\.textContent/);
+    assert.match(html, /\/api\/acceptance\/template/);
+    assert.match(html, /\/api\/acceptance\/runbook/);
+    assert.match(html, /loadAcceptanceRunbook/);
+    assert.match(html, /copyAcceptanceCommand/);
+    assert.match(html, /Copy Shared Runbook/);
+    assert.match(html, /runAcceptanceGate/);
+    assert.match(html, /acceptanceReportResult/);
+    assert.match(html, /downloadAcceptanceReport/);
+    assert.match(html, /\/api\/acceptance\/report/);
+    assert.match(html, /Automatic Checks/);
+    assert.match(html, /Manual Evidence/);
     assert.match(html, /Agent Context/);
     assert.match(html, /Gateway Manifest/);
     assert.match(html, /MCP Config/);
     assert.match(html, /Offline Recovery/);
     assert.match(html, /Submit Task/);
+    assert.match(html, /Failure Retry Policy/);
+    assert.match(html, /retryFailureKinds/);
+    assert.match(html, /retryExitCodes/);
+    assert.match(html, /retryPolicy:/);
+    assert.match(html, /task\.failureKind/);
+    assert.match(html, /task\.notBeforeAt/);
+    assert.match(html, /uploadDashboardInput/);
+    assert.match(html, /input-uploads/);
+    assert.match(html, /digestMode: 'server'/);
+    assert.match(html, /Uploading .*: /);
     assert.match(html, /Distributed Planner/);
     assert.match(html, /plannerForm/);
     assert.match(html, /part_a@docker-report-a/);
@@ -170,6 +235,16 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /个用户任务/);
     assert.match(html, /data-task-filter="user"/);
     assert.match(html, /data-task-filter="all"/);
+    assert.match(html, /data-task-search/);
+    assert.match(html, /id="resourcePlatform"/);
+    assert.match(html, /id="resourceArch"/);
+    assert.match(html, /id="sessionResourcePlatform"/);
+    assert.match(html, /id="sessionResourceArch"/);
+    assert.match(html, /platform: form\.get\('resourcePlatform'\)/);
+    assert.match(html, /nadoTaskSearch/);
+    assert.match(html, /renderConsoleProgress/);
+    assert.match(html, /data-console-stage="prepare"/);
+    assert.match(html, /data-console-stage="result"/);
     assert.match(html, /taskPruneKeep/);
     assert.match(html, /pruneTaskHistory/);
     assert.match(html, /clearWorkbenchCompleted/);
@@ -199,6 +274,9 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /\/api\/tasks\//);
     assert.match(html, /events\/stream/);
     assert.match(html, /renderScheduler/);
+    assert.match(html, /renderTaskRuntime/);
+    assert.match(html, /waiting_for_session_worker/);
+    assert.match(html, /reconnect_session_worker/);
     assert.match(html, /taskNeedsAttention/);
     assert.match(html, /renderAttentionTasks/);
     assert.match(html, /Route Issue/);
@@ -235,6 +313,9 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /downloadBundle/);
     assert.match(html, /downloadBootstrapBundle/);
     assert.match(html, /Download Self-Service Bundle/);
+    assert.match(html, /inviteStrictLocalReadiness/);
+    assert.match(html, /Strict local readiness before self-service start/);
+    assert.match(html, /strictLocalReadiness: options\.strictLocalReadiness/);
     assert.match(html, /refreshNetworkInfo/);
     assert.match(html, /networkInfo/);
     assert.match(html, /loadNetworkInfo/);
@@ -293,6 +374,11 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /loadWorkerEvents/);
     assert.match(html, /\/api\/workers\/.*events/);
     assert.match(html, /shutdown/);
+    assert.match(html, /workerManagementActions/);
+    assert.match(html, /credentialRotationConfigured/);
+    assert.match(html, /rotate_token/);
+    assert.match(html, /rotate token/);
+    assert.match(html, /Queued worker command/);
     assert.match(html, /Forget/);
     assert.match(html, /data-worker-forget/);
     assert.match(html, /\/api\/workers\/.*forget/);
@@ -308,6 +394,11 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /renderDoctor/);
     assert.match(html, /Agent Test/);
     assert.match(html, /Agent Self Tests/);
+    assert.match(html, /Authentication/);
+    assert.match(html, /Signed Worker token/);
+    assert.match(html, /renderWorkerIdentity/);
+    assert.match(html, /Source Address/);
+    assert.match(html, /renderWorkerConnection/);
     assert.match(html, /verifyForm/);
     assert.match(html, /runDashboardVerify/);
     assert.match(html, /renderVerify/);
@@ -326,6 +417,8 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /downloadMcpConfig/);
     assert.match(html, /mcpConfigName/);
     assert.match(html, /recoveryForm/);
+    assert.match(html, /Allow session migration \(worker-local workspace may be lost\)/);
+    assert.match(html, /Enabled for ordinary tasks and same-worker sessions/);
     assert.match(html, /loadRecoveryCandidates/);
     assert.match(html, /recoverOfflineTasks/);
     assert.match(html, /recoveryCandidates/);
@@ -354,6 +447,13 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /renderDispatchPlan/);
     assert.match(html, /dispatchPlan/);
     assert.match(html, /sessionForm/);
+    assert.match(html, /Control RTT/);
+    assert.match(html, /Control bandwidth/);
+    assert.match(html, /Disk available/);
+    assert.match(html, /Temperatures/);
+    assert.equal((html.match(/const formElement = event\.currentTarget;/g) || []).length, 2);
+    assert.equal((html.match(/formElement\.reset\(\);/g) || []).length, 2);
+    assert.doesNotMatch(html, /event\.currentTarget\.reset\(\)/);
     assert.match(html, /Manage Task/);
     assert.match(html, /data-task-view/);
     assert.match(html, /data-task-events/);
@@ -404,7 +504,33 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(html, /bindBatchNavigationButtons/);
     assert.match(html, /loadSessionDetail/);
     assert.match(html, /authorization: 'Bearer '/);
-    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+    assert.match(html, /Audit Trail/);
+    assert.match(html, /Audit Shipping/);
+    assert.match(html, /External audit mirror degraded/);
+    assert.match(html, /CPU utilization/);
+    assert.match(html, /Memory available/);
+    assert.match(html, /'Run agent self-test task': '运行 Agent 自测任务'/);
+    assert.match(html, /'Network deployment': '网络部署方式'/);
+    assert.match(html, /'Audit Trail': '审计记录'/);
+    assert.match(html, /'CPU utilization': 'CPU 使用率'/);
+    assert.match(html, /'Capture the network deployment boundary receipt': '采集网络部署边界回执'/);
+    assert.match(html, /'Run the strict final completeness gate': '运行最终严格完整性门禁'/);
+    assert.match(html, /chinese \? ' 个逻辑核心 · 负载 ' : ' logical cores · load '/);
+    assert.match(html, /chinese \? '下行 ' : 'Down '/);
+    assert.match(html, /const acceptanceCheckCopyZh = \{/);
+    assert.match(html, /workerIdentity: \['所选工作端使用最小权限、已签名且可撤销的身份'/);
+    assert.match(html, /acceptanceCheckCopy\(item, 'summary'\)/);
+    assert.match(html, /acceptanceCheckCopy\(item, 'action'\)/);
+    assert.match(html, /acceptanceCheckCopy\(validated, 'nextAction'\)/);
+    assert.match(html, /downloadAuditTrail/);
+    assert.match(html, /\/api\/audit\/export/);
+    assert.match(html, /localStorage\.removeItem\('nadoToken'\)/);
+    assert.match(html, /sessionStorage\.removeItem\('nadoToken'\)/);
+    assert.doesNotMatch(html, /(?:localStorage|sessionStorage)\.setItem\('nadoToken'/);
+    const nonce = contentSecurityPolicy.match(/script-src 'nonce-([^']+)'/)?.[1];
+    assert.ok(nonce);
+    assert.match(html, new RegExp(`<style nonce="${nonce}">`));
+    const script = html.match(new RegExp(`<script nonce="${nonce}">([\\s\\S]*)<\\/script>`))?.[1];
     assert.ok(script);
     assert.doesNotThrow(() => new Function(script));
 
@@ -419,6 +545,14 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(deniedContext.status, 401);
     const deniedCapabilities = await fetch(`${controlUrl}/api/capabilities`);
     assert.equal(deniedCapabilities.status, 401);
+    const deniedAcceptanceTemplate = await fetch(`${controlUrl}/api/acceptance/template`);
+    assert.equal(deniedAcceptanceTemplate.status, 401);
+    const deniedAcceptanceRunbook = await fetch(`${controlUrl}/api/acceptance/runbook?workerId=home-worker`);
+    assert.equal(deniedAcceptanceRunbook.status, 401);
+    const deniedAcceptanceEvidenceRecord = await fetch(`${controlUrl}/api/acceptance/evidence/record`, { method: 'POST' });
+    assert.equal(deniedAcceptanceEvidenceRecord.status, 401);
+    const deniedAcceptanceReport = await fetch(`${controlUrl}/api/acceptance/report`, { method: 'POST' });
+    assert.equal(deniedAcceptanceReport.status, 401);
     const deniedNetwork = await fetch(`${controlUrl}/api/network`);
     assert.equal(deniedNetwork.status, 401);
     const deniedMcpConfig = await fetch(`${controlUrl}/api/mcp-config`);
@@ -435,28 +569,90 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(deniedPlannerRun.status, 401);
 
     const client = new NadoClient({ controlUrl, token });
+    const health = await client.health();
+    assert.match(health.runtime.instanceId, /^control_[0-9a-f-]{36}$/);
+    assert.ok(Date.parse(health.runtime.startedAt));
+    assert.equal(health.runtime.build.protocolVersion, 1);
+    assert.match(health.runtime.build.sourceFingerprint, /^sha256:[a-f0-9]{64}$/);
+    assert.ok(Date.parse(health.clock.serverTime));
+    assert.equal(health.clock.signedWorkerMaxSkewMs, 300_000);
     const status = await client.status();
     assert.equal(status.workers.total, 0);
+    assert.equal(status.runtime.instanceId, health.runtime.instanceId);
+    assert.equal(status.runtime.startedAt, health.runtime.startedAt);
     const capabilities = await client.capabilities();
     assert.equal(capabilities.name, 'nado-agent');
     assert.equal(capabilities.auth.type, 'bearer');
+    assert.equal(capabilities.auth.configuredAdminTokenLogging, 'redacted');
+    assert.equal(capabilities.security.administratorCredential.remoteStartRequiresExplicitCredential, true);
+    assert.equal(capabilities.security.administratorCredential.generatedTokenFileOutsideControlData, true);
+    assert.equal(capabilities.security.administratorCredential.remoteQuickstartDashboardTokenInjection, false);
+    assert.deepEqual(capabilities.runtime, health.runtime);
     assert.ok(capabilities.mcp.tools.includes('nado_capabilities'));
     assert.ok(capabilities.mcp.tools.includes('nado_demo_health'));
     assert.equal(capabilities.features.workerPreflight, true);
     assert.equal(capabilities.features.workerEvents, true);
     assert.equal(capabilities.features.workerBundles, true);
+    assert.deepEqual(capabilities.features.workerServiceInstallers, ['systemd', 'windows_scheduled_task', 'macos_launch_agent']);
     assert.equal(capabilities.features.workerSelfServiceEnrollment, true);
     assert.equal(capabilities.features.signedWorkerRequests, true);
+    assert.equal(capabilities.features.workerClockSkewDiagnostics, true);
+    assert.equal(capabilities.security.workerIdentity.signedRequestMaxClockSkewMs, 300_000);
+    assert.equal(capabilities.security.workerIdentity.acceptanceRecommendedMaxClockSkewMs, 60_000);
     assert.equal(capabilities.features.batches, true);
     assert.equal(capabilities.features.eventStreams, true);
+    assert.equal(capabilities.features.automaticOfflineRecovery, false);
+    assert.equal(capabilities.features.sameWorkerSessionRecovery, true);
+    assert.equal(capabilities.features.taskRuntimeDiagnostics, true);
+    assert.equal(capabilities.reliability.taskDelivery, 'at-least-once');
+    assert.equal(capabilities.reliability.staleAttemptResultProtection, true);
+    assert.equal(capabilities.reliability.taskEventDelivery.stableIds, true);
+    assert.equal(capabilities.reliability.taskEventDelivery.orderedPerAttempt, true);
+    assert.equal(capabilities.reliability.taskEventDelivery.boundedPendingEvents, true);
+    assert.equal(capabilities.reliability.taskEventDelivery.defaultMaxPendingEvents, 256);
+    assert.equal(capabilities.reliability.taskEventDelivery.explicitGapEvents, true);
+    assert.match(capabilities.reliability.processTreeTermination.windows, /descendant-first/);
+    assert.match(capabilities.reliability.processTreeTermination.posix, /process group/);
+    assert.equal(
+      capabilities.reliability.processTreeTermination.gracefulWorkerStopWaitsForReleaseEvidence,
+      true,
+    );
+    assert.equal(
+      capabilities.reliability.automaticOfflineRecovery.sessionTasksIncluded,
+      'same-worker-only',
+    );
+    assert.match(
+      capabilities.reliability.automaticOfflineRecovery.crossWorkerSessionRecovery,
+      /manual opt-in/,
+    );
     assert.equal(capabilities.features.groupedArtifactZipDownload, true);
     assert.equal(capabilities.features.doctorAgentSelfTest, true);
     assert.equal(capabilities.features.readinessVerification, true);
     assert.equal(capabilities.features.demoHealth, true);
+    assert.equal(capabilities.features.acceptanceRunbook, true);
     assert.equal(capabilities.features.dispatchPlanning, true);
     assert.equal(capabilities.features.requireRoutableSubmit, true);
     assert.equal(capabilities.features.routingActionHints, true);
     assert.equal(capabilities.features.workerResourceDiagnostics, true);
+    assert.equal(capabilities.features.workerOperationalTelemetry, true);
+    assert.equal(capabilities.features.workerBandwidthProbe, true);
+    assert.equal(capabilities.features.platformArchitectureScheduling, true);
+    assert.equal(capabilities.features.runtimeBuildProvenance, true);
+    assert.equal(capabilities.features.workerServiceUpgradeRollback, true);
+    assert.equal(capabilities.features.protocolAwareScheduling, true);
+    assert.equal(capabilities.routingPolicy.protocolCompatibility.controlProtocolVersion, 1);
+    assert.equal(capabilities.routingPolicy.protocolCompatibility.rejectKnownMismatch, true);
+    assert.equal(capabilities.routingPolicy.protocolCompatibility.allowLegacyUnknown, true);
+    assert.equal(capabilities.features.inputDownloadRangeEvents, true);
+    assert.equal(capabilities.features.retryableFailurePolicies, true);
+    assert.deepEqual(capabilities.reliability.processFailureRetries.failureKinds, [
+      'timeout', 'process_error', 'worker_error', 'nonzero_exit',
+    ]);
+    assert.equal(capabilities.reliability.processFailureRetries.cancellationRetried, false);
+    assert.equal(capabilities.observability.workerDiskCapacity, true);
+    assert.match(capabilities.observability.taskRuntimeState, /lease.*heartbeat.*retry/);
+    assert.match(capabilities.observability.controlRoundTripLatency, /heartbeat/);
+    assert.match(capabilities.observability.controlBandwidth, /probe/);
     assert.equal(capabilities.features.workerReadinessDiagnostics, true);
     assert.equal(capabilities.features.cliSubmitFlow, true);
     assert.equal(capabilities.features.cliBatchSubmitFlow, true);
@@ -466,11 +662,20 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(capabilities.features.ipv6ControlUrls, true);
     assert.equal(capabilities.features.networkActionHints, true);
     assert.equal(capabilities.features.trustedProxyHeaders, true);
+    assert.equal(capabilities.features.authenticatedTrustedProxyHeaders, true);
+    assert.equal(capabilities.features.bundledCaddyHttpsDeployment, true);
+    assert.equal(capabilities.features.loopbackOnlyNativeControlDefault, true);
     assert.deepEqual(capabilities.features.autoCapabilityRouting, ['gpu', 'docs', 'ppt']);
     assert.equal(capabilities.networking.ipv6LiteralUrls, true);
     assert.equal(capabilities.networking.ipv6LiteralFormat, 'http://[2001:db8::10]:8765');
     assert.equal(capabilities.networking.trustProxyEnv, 'NADO_TRUST_PROXY');
-    assert.deepEqual(capabilities.networking.trustedProxyHeaders, ['X-Forwarded-Host', 'X-Forwarded-Proto']);
+    assert.equal(capabilities.networking.trustProxySecretEnv, 'NADO_TRUST_PROXY_SECRET');
+    assert.deepEqual(capabilities.networking.trustedProxyHeaders, ['X-Forwarded-Host', 'X-Forwarded-Proto', 'X-Forwarded-For']);
+    assert.equal(capabilities.networking.trustedProxyAuthenticationHeader, 'X-Nado-Proxy-Secret');
+    assert.equal(capabilities.networking.trustedProxyAuthenticationRequired, true);
+    assert.equal(capabilities.networking.publicHttpsDeployment.edgeOverlay, 'docker-compose.azure-https.yml');
+    assert.equal(capabilities.networking.publicHttpsDeployment.nativeControlHostDefault, '127.0.0.1');
+    assert.deepEqual(capabilities.networking.publicHttpsDeployment.publicPorts, [80, 443]);
     assert.equal(capabilities.networking.diagnosticsNextActionField, 'network.nextAction');
     assert.equal(capabilities.routingPolicy.explainability.mcpTool, 'nado_explain_schedule');
     assert.equal(capabilities.routingPolicy.agentReadiness.agentTasksRequireConfiguredCommand, true);
@@ -494,28 +699,137 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.equal(capabilities.endpoints.workers.forget, 'POST /api/workers/{workerId}/forget');
     assert.equal(capabilities.endpoints.workers.enrollmentTokens, 'GET|POST /api/worker-enrollment-tokens');
     assert.equal(capabilities.endpoints.workers.enrollmentTokenPrune, 'POST /api/worker-enrollment-tokens/prune');
+    assert.match(capabilities.endpoints.workers.tokenRotationPrepare, /rotation\/prepare/);
+    assert.match(capabilities.endpoints.workers.tokenRotationConfirm, /rotation\/confirm/);
     assert.match(capabilities.endpoints.tasks.artifactDownload, /download/);
+    assert.equal(
+      capabilities.endpoints.tasks.shortDisconnectObservation,
+      'POST /api/tasks/{taskId}/acceptance-observations/short-disconnect',
+    );
+    assert.equal(capabilities.endpoints.tasks.artifactUploadList, 'GET /api/tasks/{taskId}/artifact-uploads');
     assert.match(capabilities.endpoints.tasks.artifactsJson, /artifacts\/content/);
     assert.match(capabilities.endpoints.tasks.artifactsZip, /artifacts\/download/);
     assert.equal(capabilities.features.taskHistoryPruning, true);
     assert.equal(capabilities.features.systemHistoryPruning, true);
     assert.equal(capabilities.features.workerEnrollmentTokenPruning, true);
+    assert.equal(capabilities.features.workerTokenRotation, true);
+    assert.equal(capabilities.features.workerTokenRotationCrashRecovery, true);
+    assert.equal(capabilities.features.workerTokenRotationControlTriggered, true);
+    assert.equal(capabilities.features.acceptanceEvidenceRecording, true);
+    assert.equal(capabilities.features.verifiedRestoreReceipts, true);
+    assert.equal(capabilities.features.workerAuthenticationEvidence, true);
+    assert.equal(capabilities.features.workerObservedTransportAcceptance, true);
+    assert.equal(capabilities.features.shortDisconnectObservationReceipts, true);
+    assert.equal(capabilities.features.shortDisconnectReceiptValidation, true);
+    assert.deepEqual(capabilities.features.automatedAcceptanceExercises, [
+      'remoteCancellation',
+      'agentCollaboration',
+    ]);
+    assert.deepEqual(capabilities.features.supervisedAcceptanceExercises, [
+      'shortDisconnect',
+      'longDisconnectRecovery',
+      'vmRestartRecovery',
+      'largeArtifactResume',
+      'largeInputResume',
+      'backupRestore',
+    ]);
+    assert.ok(capabilities.features.workerManagement.includes('rotate_token'));
     assert.ok(capabilities.features.workerManagement.includes('forget'));
     assert.equal(capabilities.endpoints.tasks.prune, 'POST /api/tasks/prune');
     assert.equal(capabilities.endpoints.tasks.systemPrune, 'POST /api/system-history/prune');
     assert.equal(capabilities.endpoints.sessions.pruneEmptyPreview, 'GET /api/sessions/prune-empty');
     assert.equal(capabilities.endpoints.sessions.pruneEmpty, 'POST /api/sessions/prune-empty');
     assert.equal(capabilities.endpoints.verify, 'POST /api/verify');
+    assert.equal(capabilities.endpoints.acceptanceTemplate, 'GET /api/acceptance/template');
+    assert.equal(capabilities.endpoints.acceptanceRunbook, 'GET /api/acceptance/runbook');
+    assert.equal(capabilities.endpoints.acceptanceEvidenceRecord, 'POST /api/acceptance/evidence/record');
+    assert.equal(capabilities.endpoints.acceptanceReport, 'POST /api/acceptance/report');
     assert.equal(capabilities.endpoints.demoHealth, 'POST /api/demo/health');
     assert.equal(capabilities.endpoints.network, 'GET /api/network');
     assert.equal(capabilities.endpoints.dispatch.plan, 'POST /api/dispatch/plan');
     assert.equal(capabilities.endpoints.planner.plan, 'POST /api/planner/plan');
     assert.equal(capabilities.endpoints.planner.run, 'POST /api/planner/run');
+    assert.ok(capabilities.cli.examples.some(
+      (example) => example.includes('--require-complete') && example.includes('--deployment-evidence'),
+    ));
     assert.equal(capabilities.workers.length, 0);
     const network = await client.networkInfo();
     assert.equal(network.requestUrl, controlUrl);
     assert.equal(network.requestIsLoopback, true);
     assert.ok(Array.isArray(network.candidates));
+    const acceptanceTemplate = await client.acceptanceTemplate();
+    assert.equal(acceptanceTemplate.version, 1);
+    assert.equal(acceptanceTemplate.scenarios.physicalSeparation.status, 'pending');
+    assert.equal(acceptanceTemplate.scenarios.agentCollaboration.status, 'pending');
+    const acceptanceRunbook = await client.acceptanceRunbook({
+      workerId: 'home-worker',
+      deploymentMode: 'public_https',
+      requireGpu: true,
+    });
+    assert.equal(acceptanceRunbook.runbookVersion, 2);
+    assert.ok(acceptanceRunbook.steps.some((item) => item.key === 'credential_revocation'));
+    assert.ok(acceptanceRunbook.steps.some((item) => item.key === 'strict_report'));
+    assert.match(acceptanceRunbook.script, /acceptance evidence init/);
+    const acceptanceEvidence = await client.recordAcceptanceEvidence(undefined, {
+      scenario: 'physicalSeparation',
+      status: 'passed',
+      note: 'Observed the VM and home Worker on separately administered physical networks',
+      references: ['operator/network-topology.txt'],
+    });
+    assert.equal(acceptanceEvidence.scenarios.physicalSeparation.status, 'passed');
+    assert.equal(acceptanceEvidence.scenarios.agentCollaboration.status, 'pending');
+    assert.ok(acceptanceEvidence.updatedAt);
+    const invalidAcceptanceEvidence = await fetch(`${controlUrl}/api/acceptance/evidence/record`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        record: { scenario: 'physicalSeparation', status: 'passed' },
+      }),
+    });
+    assert.equal(invalidAcceptanceEvidence.status, 400);
+    const missingWorkerReport = await client.acceptanceReport({
+      workerId: 'missing-home-worker',
+      requireAgent: false,
+    });
+    assert.equal(missingWorkerReport.overall, 'failed');
+    assert.equal(missingWorkerReport.requirements.workerId, 'missing-home-worker');
+    assert.equal(missingWorkerReport.automatedChecks.find((item) => item.key === 'targetWorkerOnline').status, 'failed');
+    assert.equal(missingWorkerReport.manualChecks.find((item) => item.key === 'physicalSeparation').status, 'pending');
+    const strictMissingDeploymentReport = await client.acceptanceReport({
+      workerId: 'missing-home-worker',
+      requireAgent: false,
+      requireDeploymentEvidence: true,
+      deploymentEvidence: null,
+    });
+    assert.equal(strictMissingDeploymentReport.requirements.requireDeploymentEvidence, true);
+    assert.equal(
+      strictMissingDeploymentReport.automatedChecks.find((item) => item.key === 'deploymentBoundaryReceipt').status,
+      'failed',
+    );
+    const missingWorkerId = await fetch(`${controlUrl}/api/acceptance/report`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: '{}',
+    });
+    assert.equal(missingWorkerId.status, 400);
+    const invalidEvidenceReport = await fetch(`${controlUrl}/api/acceptance/report`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        workerId: 'missing-home-worker',
+        manualEvidence: { scenarios: { typoScenario: { status: 'pending' } } },
+      }),
+    });
+    assert.equal(invalidEvidenceReport.status, 400);
     const context = await client.context();
     assert.match(context, /Nado Agent Control Context/);
     assert.match(context, /No workers registered yet/);
@@ -524,8 +838,11 @@ test('control server serves a durable authenticated dashboard shell', async () =
     assert.match(context, /http:\/\/\[2001:db8::10\]:8765/);
     assert.match(context, /gpu: inferred from title, prompt, description, command/);
     assert.match(context, /agent readiness diagnostics/);
+    assert.match(context, /actual authentication mode/);
     assert.match(context, /one-click GPU\/docs\/PPT route checks/);
+    assert.match(context, /retryPolicy\.failureKinds/);
     assert.match(context, /real Stop Task cancellation/);
+    assert.match(context, /--deployment-evidence \.\/deployment-check\.json/);
     assert.match(context, /Check Routes/);
     assert.match(context, /`nado_capabilities`/);
     assert.match(context, /`nado_demo_health`/);
@@ -655,7 +972,7 @@ test('demo health API reports route checks without creating tasks', async () => 
     assert.deepEqual(byCapability.gpu.effectiveRequiredCapabilities, ['gpu']);
     assert.equal(byCapability.gpu.resourceDiagnostics.gpu.advertised, true);
     assert.equal(byCapability.gpu.resourceDiagnostics.gpu.source, 'advertised');
-    assert.ok(byCapability.gpu.warnings.some((warning) => /no NVIDIA\/ROCm probe/.test(warning)));
+    assert.ok(byCapability.gpu.warnings.some((warning) => /no NVIDIA\/AMD SMI probe/.test(warning)));
     assert.ok(byCapability.gpu.warnings.some((warning) => /agent command|agent|self-test/.test(warning)));
     assert.equal(byCapability.ppt.workerId, 'docs-worker');
     assert.deepEqual(byCapability.ppt.effectiveRequiredCapabilities, ['ppt']);
@@ -773,7 +1090,10 @@ test('control dashboard can bootstrap the token when explicitly enabled', async 
     assert.equal(response.status, 200);
     const html = await response.text();
     assert.match(html, /const bootstrapToken = "dashboard-token";/);
-    assert.match(html, /localStorage\.setItem\('nadoToken', bootstrapToken\)/);
+    assert.match(html, /localStorage\.removeItem\('nadoToken'\)/);
+    assert.match(html, /sessionStorage\.removeItem\('nadoToken'\)/);
+    assert.match(html, /tokenInput\.value = bootstrapToken \|\| ''/);
+    assert.doesNotMatch(html, /(?:localStorage|sessionStorage)\.setItem\('nadoToken'/);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     await fs.rm(root, { recursive: true, force: true });
@@ -824,11 +1144,13 @@ test('public control URL is advertised through control APIs and bundles', async 
 test('trusted proxy headers can advertise external HTTPS control URLs', async () => {
   const root = await makeTempDir();
   const token = 'dashboard-forwarded-token';
+  const proxySecret = 'dashboard-forwarded-proxy-secret';
   const { server, port } = await startControlServer({
     host: '127.0.0.1',
     port: 0,
     token,
     trustProxy: true,
+    trustProxySecret: proxySecret,
     dataDir: path.join(root, 'control'),
   });
   const controlUrl = `http://127.0.0.1:${port}`;
@@ -836,15 +1158,59 @@ test('trusted proxy headers can advertise external HTTPS control URLs', async ()
     authorization: `Bearer ${token}`,
     'x-forwarded-host': 'control.example.com',
     'x-forwarded-proto': 'https',
+    'x-nado-proxy-secret': proxySecret,
   };
 
   try {
+    const spoofed = await (await fetch(`${controlUrl}/api/network`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-forwarded-host': 'spoofed.example.com',
+        'x-forwarded-proto': 'https',
+      },
+    })).json();
+    assert.equal(spoofed.requestUrl, controlUrl);
+    assert.equal(spoofed.trustProxyConfigured, true);
+    assert.equal(spoofed.proxyAuthenticationConfigured, true);
+    assert.equal(spoofed.proxyAuthenticated, false);
+
+    const wrongSecret = await (await fetch(`${controlUrl}/api/network`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-forwarded-host': 'wrong-secret.example.com',
+        'x-forwarded-proto': 'https',
+        'x-nado-proxy-secret': 'wrong-proxy-secret',
+      },
+    })).json();
+    assert.equal(wrongSecret.requestUrl, controlUrl);
+    assert.equal(wrongSecret.proxyAuthenticated, false);
+
+    const spoofedWorker = await (await fetch(`${controlUrl}/api/workers/register`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+        'x-forwarded-for': '198.51.100.99',
+        'x-forwarded-proto': 'https',
+      },
+      body: JSON.stringify({ id: 'spoof-attempt', capabilities: ['code'] }),
+    })).json();
+    assert.equal(spoofedWorker.worker.connection.addressSource, 'socket');
+    assert.equal(spoofedWorker.worker.connection.protocol, 'http');
+    assert.equal(spoofedWorker.worker.connection.trustedProxy, false);
+    assert.equal(spoofedWorker.worker.connection.proxyAuthenticated, false);
+
     const capabilities = await (await fetch(`${controlUrl}/api/capabilities`, { headers })).json();
     assert.equal(capabilities.controlUrl, 'https://control.example.com');
     assert.equal(capabilities.surfaces.dashboard, 'https://control.example.com/dashboard');
+    assert.equal(capabilities.networking.trustedProxy.currentRequestAuthenticated, true);
+    assert.equal(capabilities.networking.trustedProxy.secretConfigured, true);
+    assert.equal(JSON.stringify(capabilities).includes(proxySecret), false);
 
     const network = await (await fetch(`${controlUrl}/api/network`, { headers })).json();
     assert.equal(network.trustProxy, true);
+    assert.equal(network.proxyAuthenticated, true);
+    assert.equal(JSON.stringify(network).includes(proxySecret), false);
     assert.equal(network.requestUrl, 'https://control.example.com');
     assert.equal(network.requestProtocol, 'https');
     assert.equal(network.preferredRemoteControlUrl, 'https://control.example.com');
@@ -853,6 +1219,21 @@ test('trusted proxy headers can advertise external HTTPS control URLs', async ()
     await new Promise((resolve) => server.close(resolve));
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('trusted proxy mode fails fast without a shared secret', async () => {
+  const root = await makeTempDir();
+  await assert.rejects(
+    startControlServer({
+      host: '127.0.0.1',
+      port: 0,
+      token: 'missing-proxy-secret-token',
+      trustProxy: true,
+      dataDir: path.join(root, 'control'),
+    }),
+    /NADO_TRUST_PROXY_SECRET/,
+  );
+  await fs.rm(root, { recursive: true, force: true });
 });
 
 test('worker bootstrap bundles prefer a non-loopback control URL candidate', async () => {

@@ -4,7 +4,7 @@ This checklist is the pre-push gate for publishing Nado Agent to GitHub.
 
 ## Current Result
 
-- The source tree is not currently a Git repository in this workspace, so there is no tracked/untracked split to audit with `git status`.
+- The source tree is a Git repository. Always audit tracked, untracked, and ignored files with `git status --short --ignored` before publishing.
 - No production API keys or private key files were found in source files outside ignored runtime output.
 - The only token-like values found in publishable source are documented demo placeholders such as `dev-token`, `docker-demo-token`, `NADO_TOKEN`, and test fixtures.
 - `.nado/` contains runtime state, logs, screenshots, generated worker bundles, demo task outputs, and MCP config snapshots. It must stay uncommitted.
@@ -22,7 +22,7 @@ This checklist is the pre-push gate for publishing Nado Agent to GitHub.
 
 ## Safe To Publish
 
-- `src/`, `test/`, `docs/`, `deploy/`
+- `src/`, `test/`, `docs/`, `deploy/`, `.github/workflows/`
 - `README.md`, `DEMO.md`, `AGENTS.md`
 - `Dockerfile`
 - `docker-compose.yml` as a documented demo-only compose file
@@ -40,7 +40,7 @@ rg -n --hidden -S "(OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|AZURE_.*SECRET
 
 3. Treat matches in docs/tests as acceptable only when they are obvious placeholders or test fixtures.
 4. Run `npm test`.
-5. Confirm GitHub Actions can run `npm ci`, `npm test`, the secret scan, compose config validation, and Docker image build.
+5. Confirm GitHub Actions can run `npm ci`, `npm test`, the secret scan, all three Compose validations, native Caddy validation, pinned Bicep compilation, and separate Control/Worker image builds.
 6. Do not commit runtime output from `.nado/`; if a Git repo already exists elsewhere, confirm with `git status --short --ignored`.
 
 ## Production Security Notes
@@ -49,6 +49,7 @@ rg -n --hidden -S "(OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|AZURE_.*SECRET
 - Rotate admin tokens by temporarily setting `NADO_ADMIN_TOKENS` to both old and new comma-separated values, updating clients, then removing the old token.
 - Do not run production with `NADO_DASHBOARD_AUTO_TOKEN=true` or `--dashboard-auto-token`.
 - Do not put `NADO_TOKEN` in process command-line arguments for production services. Use the `.env` file, VM secret management, or an orchestrator secret mechanism.
+- Configured tokens are redacted from startup logs. For remote provisioning, use `--generate-token-file` only with a private path outside Control data, import it into secret management, and never commit that file or include it in backups/artifacts.
 - Use `NADO_STORE=sqlite` for VM deployments. JSON remains useful for local development and small disposable demos.
 - Prefer HTTPS through a reverse proxy or Azure Application Gateway when the dashboard is reachable from the public internet.
 - Restrict inbound Azure NSG rules to trusted operator and worker source ranges whenever possible.

@@ -295,6 +295,8 @@ export function candidateControlUrls({
 export function buildNetworkInfo(request, options = {}) {
   const serverPort = options.port || request.socket?.localPort || 8765;
   const trustProxy = Boolean(options.trustProxy);
+  const trustProxyConfigured = Boolean(options.trustProxyConfigured ?? trustProxy);
+  const proxyAuthenticationConfigured = Boolean(options.proxyAuthenticationConfigured ?? trustProxy);
   const hostHeader = trustedHostHeader(request, trustProxy, `127.0.0.1:${serverPort}`);
   const protocol = trustedProtocol(request, trustProxy, options.protocol || 'http');
   const port = portFromHostHeader(hostHeader, serverPort);
@@ -333,6 +335,9 @@ export function buildNetworkInfo(request, options = {}) {
     requestHost,
     requestProtocol: protocol,
     trustProxy,
+    trustProxyConfigured,
+    proxyAuthenticationConfigured,
+    proxyAuthenticated: trustProxy,
     bindHost: options.host || null,
     port,
     requestIsLoopback,

@@ -1,3 +1,5 @@
+import { workerResourceCapacity } from './resource-model.js';
+
 export function gpuResourceDiagnostic(worker = {}) {
   const tools = worker.inventory?.tools || {};
   const probes = [
@@ -6,6 +8,12 @@ export function gpuResourceDiagnostic(worker = {}) {
       tool: 'nvidiaSmi',
       available: Boolean(tools.nvidiaSmi?.available),
       version: tools.nvidiaSmi?.version || null,
+    },
+    {
+      name: 'amd-smi',
+      tool: 'amdSmi',
+      available: Boolean(tools.amdSmi?.available),
+      version: tools.amdSmi?.version || null,
     },
     {
       name: 'rocm-smi',
@@ -18,20 +26,59 @@ export function gpuResourceDiagnostic(worker = {}) {
   const detected = probes.some((probe) => probe.available);
   const source = detected ? 'probe' : (advertised ? 'advertised' : 'none');
   const warning = advertised && !detected
-    ? 'gpu capability is advertised but no NVIDIA/ROCm probe was reported; verify the worker GPU runtime before scheduling real accelerator workloads'
+    ? 'gpu capability is advertised but no NVIDIA/AMD SMI probe was reported; verify the worker GPU runtime before scheduling real accelerator workloads'
     : '';
+  const capacity = workerResourceCapacity(worker);
   return {
     advertised,
     detected,
     source,
     probes,
+    devices: capacity.allGpus,
+    count: capacity.gpuCount,
+    memoryTotalBytes: capacity.gpuMemoryBytes,
     warning,
   };
 }
 
 export function workerResourceDiagnostics(worker = {}) {
+  const capacity = workerResourceCapacity(worker);
+  const hostTemperatures = worker.inventory?.resources?.temperatures || [];
+  const gpuTemperatures = capacity.allGpus
+    .filter((gpu) => Number.isFinite(Number(gpu.temperatureC)))
+    .map((gpu) => ({
+      name: gpu.name,
+      source: `${gpu.vendor || 'gpu'}-device`,
+      temperatureC: Number(gpu.temperatureC),
+    }));
   return {
     gpu: gpuResourceDiagnostic(worker),
+    cpu: {
+      logicalCores: capacity.cpuCores,
+      utilizationPercent: worker.metrics?.cpu?.utilizationPercent ?? null,
+      loadAverage1m: worker.metrics?.cpu?.loadAverage1m ?? worker.metrics?.loadavg?.[0] ?? 0,
+      loadAverage5m: worker.metrics?.cpu?.loadAverage5m ?? worker.metrics?.loadavg?.[1] ?? 0,
+      loadAverage15m: worker.metrics?.cpu?.loadAverage15m ?? worker.metrics?.loadavg?.[2] ?? 0,
+      measurement: worker.metrics?.cpu?.measurement || 'legacy load average only',
+    },
+    memory: {
+      totalBytes: capacity.memoryBytes,
+      freeBytes: Math.max(0, Number(worker.metrics?.memory?.freeBytes ?? worker.metrics?.freemem ?? 0)),
+      usedBytes: Math.max(0, Number(worker.metrics?.memory?.usedBytes ?? 0)),
+      usedPercent: worker.metrics?.memory?.usedPercent ?? null,
+      measurement: worker.metrics?.memory?.measurement || 'legacy free memory only',
+    },
+    disk: worker.metrics?.disk || {
+      available: false,
+      error: 'not_reported',
+    },
+    network: worker.metrics?.control || {
+      roundTripMs: null,
+      lastSuccessAt: null,
+      lastErrorAt: null,
+      consecutiveErrors: 0,
+    },
+    temperatures: [...hostTemperatures, ...gpuTemperatures],
   };
 }
 

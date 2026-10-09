@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import initSqlJs from 'sql.js';
@@ -11,14 +12,70 @@ import {
   effectiveRequiredCapabilities,
   missingRequiredTools,
   normalizeToolName,
+  protocolReadinessForWorker,
   scheduleTask,
   taskSlotCost,
 } from './scheduler.js';
 import { buildDispatchPlan } from './dispatch-plan.js';
 import { routingActionHint } from './routing-diagnostics.js';
 import { workerReadinessDiagnostics, workerResourceDiagnostics } from './worker-diagnostics.js';
+import {
+  normalizeResourceRequirements,
+  resourceFitForTask,
+  resourceRequirementsEmpty,
+  workerResourceCapacity,
+  workerResourceUsage,
+} from './resource-model.js';
+import {
+  normalizeRetryPolicy,
+  normalizeTaskFailureKind,
+  retryPolicyMatch,
+} from './retry-policy.js';
+import { normalizeRuntimeBuild } from './runtime-build.js';
 
 const ACTIVE_WINDOW_MS = 45_000;
+const DEFAULT_TASK_LEASE_MS = 60_000;
+const MIN_TASK_LEASE_MS = 5_000;
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_RETRY_BACKOFF_MS = 1_000;
+const DEFAULT_MAX_RETRY_BACKOFF_MS = 60_000;
+const DEFAULT_MAX_ARTIFACT_CHUNK_BYTES = 16 * 1024 * 1024;
+const DEFAULT_WORKER_TOKEN_ROTATION_TTL_MS = 10 * 60_000;
+const MIN_WORKER_TOKEN_ROTATION_TTL_MS = 60_000;
+const MAX_WORKER_TOKEN_ROTATION_TTL_MS = 60 * 60_000;
+const CONTROL_ONLY_WORKER_EVENT_TYPES = new Set(['runtime_started']);
+export const CURRENT_STATE_VERSION = 2;
+export const CURRENT_SQLITE_SCHEMA_VERSION = 1;
+
+export function normalizeTaskLeaseMs(value, fallback = DEFAULT_TASK_LEASE_MS) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.max(MIN_TASK_LEASE_MS, Math.floor(parsed));
+}
+
+function normalizeMaxAttempts(value) {
+  const parsed = Number(value ?? DEFAULT_MAX_ATTEMPTS);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(100, Math.floor(parsed))) : DEFAULT_MAX_ATTEMPTS;
+}
+
+function normalizeRetryBackoffMs(value, fallback = DEFAULT_RETRY_BACKOFF_MS) {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : fallback;
+}
+
+function retryDelayMs(task) {
+  const baseMs = normalizeRetryBackoffMs(task.retryBackoffMs);
+  const maxMs = Math.max(baseMs, normalizeRetryBackoffMs(task.maxRetryBackoffMs, DEFAULT_MAX_RETRY_BACKOFF_MS));
+  const exponent = Math.max(0, Number(task.attemptSeq || 1) - 1);
+  return Math.min(maxMs, baseMs * (2 ** Math.min(exponent, 20)));
+}
+
+function leaseExpired(task, atMs = Date.now()) {
+  const expiresAt = task?.lease?.expiresAt ? Date.parse(task.lease.expiresAt) : 0;
+  return Boolean(expiresAt && expiresAt <= atMs);
+}
 
 function maxConcurrency(value) {
   return Math.max(1, Number(value || 1));
@@ -34,6 +91,24 @@ function normalizeTaskIds(ids = [], fallback = null) {
     values.push(fallback);
   }
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+function normalizeWorkerRuntime(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const id = String(value.id || '').trim().slice(0, 160);
+  const startedAt = String(value.startedAt || '').trim();
+  const pid = Number(value.pid);
+  if (!id || !Number.isFinite(Date.parse(startedAt))) {
+    return null;
+  }
+  return {
+    id,
+    startedAt: new Date(Date.parse(startedAt)).toISOString(),
+    pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+    build: normalizeRuntimeBuild(value.build),
+  };
 }
 
 function normalizeStringList(value) {
@@ -118,6 +193,10 @@ function mergeBatchTaskDefaults(defaults = {}, spec = {}) {
     ...normalizeLabels(defaults.requiredLabels || defaults.labels),
     ...normalizeLabels(spec.requiredLabels || spec.labels),
   };
+  merged.requiredResources = {
+    ...normalizeResourceRequirements(defaults.requiredResources || defaults.resources),
+    ...normalizeResourceRequirements(spec.requiredResources || spec.resources),
+  };
   merged.env = {
     ...normalizeEnv(defaults.env),
     ...normalizeEnv(spec.env),
@@ -141,6 +220,9 @@ function mergeBatchTaskDefaults(defaults = {}, spec = {}) {
       defaults.sandbox,
     ));
   }
+  if (hasOwn(spec, 'retryPolicy') || hasOwn(defaults, 'retryPolicy')) {
+    merged.retryPolicy = firstDefined(spec.retryPolicy, defaults.retryPolicy);
+  }
   delete merged.worker;
   delete merged.session;
   delete merged.capabilities;
@@ -148,6 +230,7 @@ function mergeBatchTaskDefaults(defaults = {}, spec = {}) {
   delete merged.taskSlots;
   delete merged.labels;
   delete merged.sandbox;
+  delete merged.resources;
   return merged;
 }
 
@@ -184,6 +267,9 @@ function isSystemBatch(batch) {
 }
 
 function taskNeedsAttention(task) {
+  if (task?.runtimeDiagnostics?.needsAttention) {
+    return true;
+  }
   if (!task || task.status !== 'queued' || !task.scheduler) {
     return false;
   }
@@ -204,9 +290,11 @@ function attentionTaskSummary(task) {
     requestedWorkerId: task.requestedWorkerId || null,
     assignedWorkerId: task.assignedWorkerId || null,
     schedulerReason: task.scheduler?.reason || null,
-    nextAction: routingActionHint(task),
+    nextAction: task.runtimeDiagnostics?.nextAction || task.nextAction || routingActionHint(task),
+    runtimeDiagnostics: task.runtimeDiagnostics || null,
     inferredCapabilities: task.scheduler?.inferredCapabilities || [],
     effectiveRequiredCapabilities: task.scheduler?.effectiveRequiredCapabilities || [],
+    requiredResources: task.requiredResources || {},
     candidateReasons: Array.from(new Set(candidateReasons)),
     createdAt: task.createdAt || null,
     updatedAt: task.updatedAt || null,
@@ -228,7 +316,215 @@ function emptySessionRecord(session = {}) {
     && !session.workspace;
 }
 
-function compactTaskSnapshot(task) {
+export function buildTaskRuntimeDiagnostics(task, context = {}) {
+  const nowMs = Number(context.nowMs ?? Date.now());
+  const worker = context.worker || null;
+  const session = context.session || null;
+  const workerId = task?.assignedWorkerId || task?.requestedWorkerId || session?.assignedWorkerId || null;
+  const leaseExpiresAtMs = task?.lease?.expiresAt ? Date.parse(task.lease.expiresAt) : Number.NaN;
+  const leaseRemainingMs = Number.isFinite(leaseExpiresAtMs) ? leaseExpiresAtMs - nowMs : null;
+  const lease = task?.lease ? {
+    ...task.lease,
+    remainingMs: leaseRemainingMs,
+    expired: leaseRemainingMs !== null && leaseRemainingMs <= 0,
+  } : null;
+  const latestQueueOwnershipEvent = [...(task?.events || [])].reverse().find((event) => (
+    [
+      'lease_recovered',
+      'offline_recovered',
+      'requeued',
+      'rescheduled',
+      'retry_scheduled',
+      'claimed',
+      'cancelled',
+      'succeeded',
+      'failed',
+    ].includes(event.type)
+  )) || null;
+  const recoveryEvent = (
+    ['lease_recovered', 'offline_recovered'].includes(latestQueueOwnershipEvent?.type)
+    && latestQueueOwnershipEvent?.data?.sessionRecoveryMode === 'same-worker'
+  ) ? latestQueueOwnershipEvent : null;
+  const workerState = worker ? {
+    id: worker.id,
+    active: Boolean(worker.active),
+    gatewayState: worker.gatewayState || 'unknown',
+    adminState: worker.adminState || 'unknown',
+    ageMs: Number.isFinite(Number(worker.ageMs)) ? Number(worker.ageMs) : null,
+    availableSlots: Number.isFinite(Number(worker.availableSlots)) ? Number(worker.availableSlots) : null,
+    runningSlots: Number.isFinite(Number(worker.runningSlots)) ? Number(worker.runningSlots) : null,
+    maxConcurrency: Number.isFinite(Number(worker.maxConcurrency)) ? Number(worker.maxConcurrency) : null,
+  } : (workerId ? {
+    id: workerId,
+    active: false,
+    gatewayState: 'missing',
+    adminState: 'unknown',
+    ageMs: null,
+    availableSlots: null,
+    runningSlots: null,
+    maxConcurrency: null,
+  } : null);
+  const base = {
+    state: 'unknown',
+    summary: 'Task runtime state is unavailable',
+    needsAttention: false,
+    attemptId: task?.currentAttemptId || null,
+    attemptSeq: Number(task?.attemptSeq || 0),
+    maxAttempts: normalizeMaxAttempts(task?.maxAttempts),
+    worker: workerState,
+    lease,
+    session: task?.sessionId ? {
+      id: task.sessionId,
+      assignedWorkerId: session?.assignedWorkerId || null,
+      workspace: session?.workspace || null,
+      recoveryMode: recoveryEvent ? 'same-worker' : null,
+      recoveryEventAt: recoveryEvent?.at || null,
+    } : null,
+    nextAction: null,
+  };
+
+  if (!task) {
+    return base;
+  }
+  if (terminalTaskStatus(task.status)) {
+    return {
+      ...base,
+      state: 'terminal',
+      summary: `Task is ${task.status}`,
+    };
+  }
+  if (task.status === 'running') {
+    if (!lease) {
+      return {
+        ...base,
+        state: 'lease_missing',
+        summary: 'Running task has no execution lease',
+        needsAttention: true,
+        nextAction: {
+          code: 'inspect_missing_task_lease',
+          message: 'Inspect control state and Worker logs, then recover or cancel this task before accepting more output.',
+          workerId,
+        },
+      };
+    }
+    if (lease?.expired) {
+      const sessionPinned = Boolean(task.sessionId && (session?.assignedWorkerId || workerId));
+      return {
+        ...base,
+        state: 'lease_expired',
+        summary: sessionPinned
+          ? `Attempt lease expired; recovery must remain on session Worker ${session?.assignedWorkerId || workerId}`
+          : 'Attempt lease expired and is awaiting recovery',
+        needsAttention: true,
+        nextAction: {
+          code: sessionPinned ? 'recover_on_session_worker' : 'recover_expired_task',
+          message: sessionPinned
+            ? `Restore Worker ${session?.assignedWorkerId || workerId}; automatic recovery will keep the session on that workspace owner.`
+            : 'Run offline-task recovery or inspect the automatic recovery supervisor.',
+          workerId: session?.assignedWorkerId || workerId,
+        },
+      };
+    }
+    if (workerState && !workerState.active) {
+      return {
+        ...base,
+        state: 'worker_heartbeat_stale',
+        summary: 'Worker heartbeat is stale while the attempt lease is still live',
+        needsAttention: true,
+        nextAction: {
+          code: 'restore_worker_before_lease_expiry',
+          message: `Restore Worker ${workerId} connectivity before the lease expires, or prepare for at-least-once recovery.`,
+          workerId,
+        },
+      };
+    }
+    return {
+      ...base,
+      state: 'running_healthy',
+      summary: 'Worker heartbeat and attempt lease are healthy',
+    };
+  }
+
+  const notBeforeMs = task.notBeforeAt ? Date.parse(task.notBeforeAt) : Number.NaN;
+  if (task.status === 'queued' && Number.isFinite(notBeforeMs) && notBeforeMs > nowMs) {
+    return {
+      ...base,
+      state: 'retry_backoff',
+      summary: `Retry is delayed until ${task.notBeforeAt}`,
+      nextAction: {
+        code: 'wait_for_retry_backoff',
+        message: 'Wait for the bounded retry delay, or cancel the task if it is no longer required.',
+      },
+    };
+  }
+  if (task.status === 'queued' && recoveryEvent && task.sessionId) {
+    if (!workerState?.active) {
+      return {
+        ...base,
+        state: 'waiting_for_session_worker',
+        summary: `Recovered session task is waiting for Worker ${workerId}`,
+        needsAttention: true,
+        nextAction: {
+          code: 'reconnect_session_worker',
+          message: `Reconnect the original session Worker ${workerId}; another Worker cannot claim its local workspace.`,
+          workerId,
+        },
+      };
+    }
+    if (workerState.adminState !== 'enabled') {
+      return {
+        ...base,
+        state: 'session_worker_disabled',
+        summary: `Session Worker ${workerId} is ${workerState.adminState}`,
+        needsAttention: true,
+        nextAction: {
+          code: 'enable_session_worker',
+          message: `Resume Worker ${workerId} so it can reclaim the session task.`,
+          workerId,
+        },
+      };
+    }
+    if (
+      workerState.runningSlots !== null
+      && workerState.maxConcurrency !== null
+      && workerState.runningSlots + taskSlotCost(task) > workerState.maxConcurrency
+    ) {
+      return {
+        ...base,
+        state: 'waiting_for_session_worker_slot',
+        summary: `Session Worker ${workerId} has no available task slot`,
+        needsAttention: true,
+        nextAction: {
+          code: 'wait_for_session_worker_slot',
+          message: `Wait for capacity on Worker ${workerId}, or cancel lower-priority work on that Worker.`,
+          workerId,
+        },
+      };
+    }
+    return {
+      ...base,
+      state: 'awaiting_session_claim',
+      summary: `Session Worker ${workerId} is online and can reclaim the task`,
+    };
+  }
+  if (task.status === 'queued') {
+    return {
+      ...base,
+      state: task.scheduler?.workerId ? 'awaiting_claim' : 'awaiting_route',
+      summary: task.scheduler?.workerId
+        ? `Task is waiting for Worker ${task.scheduler.workerId} to claim it`
+        : 'Task is waiting for an eligible route',
+    };
+  }
+  return {
+    ...base,
+    state: task.status || 'unknown',
+    summary: `Task is ${task.status || 'in an unknown state'}`,
+  };
+}
+
+function compactTaskSnapshot(task, runtimeDiagnostics = null) {
+  const routingNextAction = routingActionHint(task);
   return {
     id: task.id,
     title: task.title,
@@ -244,14 +540,23 @@ function compactTaskSnapshot(task) {
     requiredCapabilities: task.requiredCapabilities || [],
     requiredTools: task.requiredTools || [],
     requiredLabels: task.requiredLabels || {},
+    requiredResources: task.requiredResources || {},
     scheduler: task.scheduler || null,
-    nextAction: routingActionHint(task),
+    nextAction: runtimeDiagnostics?.nextAction || routingNextAction,
+    routingNextAction,
+    runtimeDiagnostics,
     attemptSeq: task.attemptSeq || 0,
+    maxAttempts: normalizeMaxAttempts(task.maxAttempts),
+    retryPolicy: normalizeRetryPolicy(task.retryPolicy),
+    notBeforeAt: task.notBeforeAt || null,
+    lease: task.lease || null,
+    idempotencyKey: task.idempotencyKey || null,
     createdAt: task.createdAt || null,
     updatedAt: task.updatedAt || null,
     startedAt: task.startedAt || null,
     completedAt: task.completedAt || null,
     exitCode: task.exitCode ?? null,
+    failureKind: task.failureKind || null,
     error: task.error || null,
     workspaceCleaned: Boolean(task.workspaceCleaned),
     artifactCount: Array.isArray(task.artifacts) ? task.artifacts.filter((artifact) => !artifact.skipped).length : 0,
@@ -278,17 +583,22 @@ function requireRoutableError(plan) {
 
 function initialState() {
   return {
-    version: 1,
+    version: CURRENT_STATE_VERSION,
     workers: {},
     workerTokens: {},
     workerSignatureNonces: {},
     workerEnrollmentTokens: {},
     sessions: {},
     batches: {},
+    artifactUploads: {},
+    inputUploads: {},
+    auditEvents: [],
     workerTokenOrder: [],
     workerEnrollmentTokenOrder: [],
     sessionOrder: [],
     batchOrder: [],
+    artifactUploadOrder: [],
+    inputUploadOrder: [],
     tasks: {},
     taskOrder: [],
     commandOrder: [],
@@ -296,20 +606,67 @@ function initialState() {
 }
 
 function normalizeStateShape(state) {
+  if (state !== undefined && state !== null && (typeof state !== 'object' || Array.isArray(state))) {
+    throw new Error('Control state must be a JSON object');
+  }
   const normalized = state || initialState();
+  const sourceVersion = Number(normalized.version ?? 0);
+  if (!Number.isInteger(sourceVersion) || sourceVersion < 0) {
+    throw new Error(`Invalid control state version: ${normalized.version}`);
+  }
+  if (sourceVersion > CURRENT_STATE_VERSION) {
+    throw new Error(`Control state version ${sourceVersion} is newer than supported version ${CURRENT_STATE_VERSION}`);
+  }
   normalized.workers ??= {};
+  for (const worker of Object.values(normalized.workers)) {
+    worker.runtime = normalizeWorkerRuntime(worker.runtime);
+  }
   normalized.workerTokens ??= {};
+  for (const token of Object.values(normalized.workerTokens)) {
+    token.rotationStatus ??= null;
+    token.rotationFromTokenId ??= null;
+    token.rotationToTokenId ??= null;
+    token.rotationExpiresAt ??= null;
+    token.rotationFinalExpiresAt ??= null;
+    token.rotationConfirmedAt ??= null;
+    token.rotationExpiredAt ??= null;
+    token.rotationSupersededAt ??= null;
+  }
   normalized.workerSignatureNonces ??= {};
   normalized.workerEnrollmentTokens ??= {};
   normalized.sessions ??= {};
+  for (const session of Object.values(normalized.sessions)) {
+    session.requiredResources = normalizeResourceRequirements(session.requiredResources || session.resources);
+  }
   normalized.batches ??= {};
+  normalized.artifactUploads ??= {};
+  normalized.inputUploads ??= {};
+  normalized.auditEvents = Array.isArray(normalized.auditEvents) ? normalized.auditEvents.slice(-5_000) : [];
   normalized.workerTokenOrder ??= Object.keys(normalized.workerTokens);
   normalized.workerEnrollmentTokenOrder ??= Object.keys(normalized.workerEnrollmentTokens);
   normalized.sessionOrder ??= Object.keys(normalized.sessions);
   normalized.batchOrder ??= Object.keys(normalized.batches);
+  normalized.artifactUploadOrder ??= Object.keys(normalized.artifactUploads);
+  normalized.inputUploadOrder ??= Object.keys(normalized.inputUploads);
   normalized.tasks ??= {};
+  for (const task of Object.values(normalized.tasks)) {
+    task.requiredResources = normalizeResourceRequirements(task.requiredResources || task.resources);
+    task.maxAttempts = normalizeMaxAttempts(task.maxAttempts);
+    task.retryPolicy = normalizeRetryPolicy(task.retryPolicy);
+    task.retryBackoffMs = normalizeRetryBackoffMs(task.retryBackoffMs);
+    task.maxRetryBackoffMs = Math.max(
+      task.retryBackoffMs,
+      normalizeRetryBackoffMs(task.maxRetryBackoffMs, DEFAULT_MAX_RETRY_BACKOFF_MS),
+    );
+    task.notBeforeAt ??= null;
+    task.lease ??= null;
+    task.idempotencyKey ??= null;
+    task.failureKind = normalizeTaskFailureKind(task.failureKind);
+    task.inputReadyStatus ??= null;
+  }
   normalized.taskOrder ??= Object.keys(normalized.tasks);
   normalized.commandOrder ??= [];
+  normalized.version = CURRENT_STATE_VERSION;
   return normalized;
 }
 
@@ -333,6 +690,23 @@ function makeWorkerToken() {
   return `nado_wt_${crypto.randomBytes(24).toString('hex')}`;
 }
 
+function normalizeWorkerTokenRotationTtlMs(value) {
+  const parsed = Number(value ?? DEFAULT_WORKER_TOKEN_ROTATION_TTL_MS);
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_WORKER_TOKEN_ROTATION_TTL_MS;
+  }
+  return Math.max(
+    MIN_WORKER_TOKEN_ROTATION_TTL_MS,
+    Math.min(MAX_WORKER_TOKEN_ROTATION_TTL_MS, Math.floor(parsed)),
+  );
+}
+
+function workerTokenRotationError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
 function makeWorkerEnrollmentToken() {
   return `nado_enroll_${crypto.randomBytes(24).toString('hex')}`;
 }
@@ -347,6 +721,22 @@ function publicWorkerEnrollmentToken(record) {
   return publicRecord;
 }
 
+function publicArtifactUpload(record) {
+  if (!record) {
+    return null;
+  }
+  const { tempPath, storagePath, ...publicRecord } = record;
+  return publicRecord;
+}
+
+function publicInputUpload(record) {
+  if (!record) {
+    return null;
+  }
+  const { tempPath, storagePath, ...publicRecord } = record;
+  return publicRecord;
+}
+
 function normalizeWorkerEvents(events) {
   return Array.isArray(events) ? events.slice(-300) : [];
 }
@@ -358,10 +748,104 @@ function taskSortTime(task) {
 export class JsonStore {
   constructor(file) {
     this.file = file;
+    this.backend = 'json';
     this.dataDir = path.dirname(file);
     this.artifactDir = path.join(this.dataDir, 'artifacts');
+    this.inputDir = path.join(this.dataDir, 'inputs');
     this.state = initialState();
     this.writeQueue = Promise.resolve();
+    this.artifactUploadQueues = new Map();
+    this.inputUploadQueues = new Map();
+    this.taskLeaseMs = DEFAULT_TASK_LEASE_MS;
+    this.claimWaiters = new Set();
+    this.writeFence = null;
+  }
+
+  setWriteFence(fence) {
+    this.writeFence = fence || null;
+  }
+
+  configureReliability(options = {}) {
+    this.taskLeaseMs = normalizeTaskLeaseMs(options.taskLeaseMs, this.taskLeaseMs);
+    return {
+      taskLeaseMs: this.taskLeaseMs,
+      defaultMaxAttempts: DEFAULT_MAX_ATTEMPTS,
+      deliverySemantics: 'at-least-once',
+    };
+  }
+
+  notifyClaimWaiters() {
+    for (const waiter of this.claimWaiters) {
+      void waiter.wake();
+    }
+  }
+
+  closeClaimWaiters() {
+    for (const waiter of [...this.claimWaiters]) {
+      waiter.finish(null);
+    }
+  }
+
+  async waitForTaskClaim(workerId, waitMs = 0, options = {}) {
+    const immediate = await this.claimTask(workerId, {
+      snapshotResult: options.snapshotResult,
+    });
+    const boundedWaitMs = Math.max(0, Math.min(30_000, Math.floor(Number(waitMs || 0))));
+    if (immediate || !boundedWaitMs) {
+      return immediate;
+    }
+
+    return new Promise((resolve) => {
+      const waiter = {
+        workerId,
+        busy: false,
+        done: false,
+        timer: null,
+        probeTimer: null,
+        finish: (task) => {
+          if (waiter.done) {
+            return;
+          }
+          waiter.done = true;
+          clearTimeout(waiter.timer);
+          clearInterval(waiter.probeTimer);
+          options.signal?.removeEventListener('abort', waiter.abort);
+          this.claimWaiters.delete(waiter);
+          resolve(task);
+        },
+        wake: async () => {
+          if (waiter.done || waiter.busy) {
+            return;
+          }
+          waiter.busy = true;
+          try {
+            const task = await this.claimTask(workerId, {
+              touchWorker: false,
+              snapshotResult: options.snapshotResult,
+            });
+            if (task) {
+              waiter.finish(task);
+            } else if (this.state.workers[workerId]?.adminState !== 'enabled') {
+              waiter.finish(null);
+            }
+          } catch {
+            waiter.finish(null);
+          } finally {
+            waiter.busy = false;
+          }
+        },
+      };
+      waiter.timer = setTimeout(() => waiter.finish(null), boundedWaitMs);
+      waiter.probeTimer = setInterval(() => void waiter.wake(), Math.min(500, boundedWaitMs));
+      waiter.abort = () => waiter.finish(null);
+      if (options.signal?.aborted) {
+        waiter.finish(null);
+        return;
+      }
+      options.signal?.addEventListener('abort', waiter.abort, { once: true });
+      this.claimWaiters.add(waiter);
+      queueMicrotask(() => void waiter.wake());
+    });
   }
 
   static defaultPath(dataDir) {
@@ -369,14 +853,29 @@ export class JsonStore {
   }
 
   async load() {
-    this.state = normalizeStateShape(await readJson(this.file, initialState()));
+    const loaded = await readJson(this.file, initialState());
+    const sourceVersion = Number(loaded?.version ?? 0);
+    this.state = normalizeStateShape(loaded);
+    this.lastMigration = {
+      fromVersion: sourceVersion,
+      toVersion: CURRENT_STATE_VERSION,
+      migrated: sourceVersion < CURRENT_STATE_VERSION,
+    };
+    if (this.lastMigration.migrated) {
+      await this.save();
+    }
   }
 
   async save() {
     const snapshot = JSON.parse(JSON.stringify(this.state));
     this.writeQueue = this.writeQueue
       .catch(() => {})
-      .then(() => writeJson(this.file, snapshot));
+      .then(async () => {
+        await this.writeFence?.assertOwned();
+        await writeJson(this.file, snapshot, {
+          beforeCommit: () => this.writeFence?.assertOwned(),
+        });
+      });
     await this.writeQueue;
   }
 
@@ -389,9 +888,14 @@ export class JsonStore {
     };
   }
 
-  async upsertWorker(worker) {
+  async upsertWorker(worker, authentication = null, connection = null) {
     const now = nowIso();
     const existing = this.state.workers[worker.id] || {};
+    const previousRuntime = normalizeWorkerRuntime(existing.runtime);
+    const reportedRuntime = normalizeWorkerRuntime(worker.runtime);
+    const currentRuntime = reportedRuntime?.id !== previousRuntime?.id
+      ? (reportedRuntime || previousRuntime)
+      : (previousRuntime || reportedRuntime);
     const updated = {
       ...existing,
       id: worker.id,
@@ -401,6 +905,15 @@ export class JsonStore {
       labels: { ...(existing.labels || {}), ...normalizeLabels(worker.labels) },
       agentCommandConfigured: Boolean(worker.agentCommandConfigured),
       agentPreset: worker.agentPreset || existing.agentPreset || null,
+      credentialRotationConfigured: Boolean(
+        worker.credentialRotationConfigured ?? existing.credentialRotationConfigured,
+      ),
+      identity: authentication
+        ? { ...authentication }
+        : existing.identity || null,
+      connection: connection
+        ? { ...connection }
+        : existing.connection || null,
       maxConcurrency: maxConcurrency(worker.maxConcurrency || existing.maxConcurrency),
       adminState: existing.adminState || 'enabled',
       observedState: worker.observedState || existing.observedState || 'idle',
@@ -408,6 +921,7 @@ export class JsonStore {
       currentTaskId: null,
       metrics: worker.metrics || existing.metrics || {},
       inventory: worker.inventory || existing.inventory || {},
+      runtime: currentRuntime,
       diagnostics: existing.diagnostics || {},
       commands: existing.commands || [],
       events: normalizeWorkerEvents(existing.events),
@@ -415,6 +929,24 @@ export class JsonStore {
       lastSeenAt: now,
     };
     updated.currentTaskId = updated.currentTaskIds[0] || null;
+    if (reportedRuntime && reportedRuntime.id !== previousRuntime?.id) {
+      this.appendWorkerEvent(updated, {
+        type: 'runtime_started',
+        level: 'info',
+        message: `Worker ${worker.id} runtime ${reportedRuntime.id} connected`,
+        data: {
+          controlObserved: true,
+          runtimeId: reportedRuntime.id,
+          runtimeStartedAt: reportedRuntime.startedAt,
+          pid: reportedRuntime.pid,
+          previousRuntimeId: previousRuntime?.id || null,
+          previousRuntimeStartedAt: previousRuntime?.startedAt || null,
+          previousLastSeenAt: existing.lastSeenAt || null,
+          authenticationType: authentication?.type || null,
+          workerTokenId: authentication?.workerTokenId || null,
+        },
+      });
+    }
     this.appendWorkerEvent(updated, {
       type: 'registered',
       level: 'info',
@@ -424,6 +956,7 @@ export class JsonStore {
         labels: updated.labels,
         maxConcurrency: updated.maxConcurrency,
         agentPreset: updated.agentPreset,
+        runtimeId: updated.runtime?.id || null,
       },
     });
     this.state.workers[worker.id] = updated;
@@ -449,6 +982,14 @@ export class JsonStore {
       lastUsedAt: null,
       expiresAt: input.expiresAt || null,
       revokedAt: null,
+      rotationStatus: null,
+      rotationFromTokenId: null,
+      rotationToTokenId: null,
+      rotationExpiresAt: null,
+      rotationFinalExpiresAt: null,
+      rotationConfirmedAt: null,
+      rotationExpiredAt: null,
+      rotationSupersededAt: null,
     };
     this.state.workerTokens[record.id] = record;
     this.state.workerTokenOrder.push(record.id);
@@ -481,6 +1022,162 @@ export class JsonStore {
     record.revokedAt = record.revokedAt || nowIso();
     await this.save();
     return publicWorkerToken(record);
+  }
+
+  async expirePendingWorkerTokenRotations(atMs = Date.now()) {
+    const expired = [];
+    const at = new Date(atMs).toISOString();
+    for (const record of Object.values(this.state.workerTokens)) {
+      if (record.rotationStatus !== 'pending' || !record.rotationExpiresAt) {
+        continue;
+      }
+      if (Date.parse(record.rotationExpiresAt) > atMs) {
+        continue;
+      }
+      record.rotationStatus = 'expired';
+      record.rotationExpiredAt = record.rotationExpiredAt || at;
+      record.revokedAt = record.revokedAt || at;
+      expired.push(publicWorkerToken(record));
+    }
+    if (expired.length) {
+      await this.save();
+    }
+    return expired;
+  }
+
+  async prepareWorkerTokenRotation(workerId, currentTokenId, input = {}) {
+    await this.expirePendingWorkerTokenRotations();
+    const current = this.state.workerTokens[currentTokenId];
+    if (!current || current.workerId !== workerId || current.revokedAt) {
+      throw workerTokenRotationError('Current Worker token is not active for this Worker', 403);
+    }
+    if (current.expiresAt && Date.parse(current.expiresAt) <= Date.now()) {
+      throw workerTokenRotationError('Current Worker token has expired', 401);
+    }
+    if (!current.publicKey) {
+      throw workerTokenRotationError('Worker token rotation requires an enrolled signed Worker identity', 409);
+    }
+    if (current.rotationStatus === 'pending') {
+      throw workerTokenRotationError('Pending Worker token must be confirmed before starting another rotation', 409);
+    }
+    const token = String(input.token || '');
+    if (!/^nado_wt_[a-f0-9]{48,}$/i.test(token)) {
+      throw workerTokenRotationError('Replacement Worker token must be a locally generated high-entropy nado_wt_ token');
+    }
+    const tokenHash = hashToken(token);
+    const existing = Object.values(this.state.workerTokens).find((candidate) => candidate.tokenHash === tokenHash);
+    if (existing) {
+      if (
+        existing.workerId === workerId
+        && existing.rotationFromTokenId === currentTokenId
+        && existing.rotationStatus === 'pending'
+        && (!existing.rotationExpiresAt || Date.parse(existing.rotationExpiresAt) > Date.now())
+      ) {
+        return {
+          workerToken: publicWorkerToken(existing),
+          previousWorkerToken: publicWorkerToken(current),
+          idempotent: true,
+        };
+      }
+      throw workerTokenRotationError('Replacement Worker token is already registered', 409);
+    }
+
+    const now = nowIso();
+    for (const pending of Object.values(this.state.workerTokens)) {
+      if (
+        pending.rotationStatus === 'pending'
+        && pending.rotationFromTokenId === currentTokenId
+        && pending.id !== existing?.id
+      ) {
+        pending.rotationStatus = 'superseded';
+        pending.rotationSupersededAt = pending.rotationSupersededAt || now;
+        pending.revokedAt = pending.revokedAt || now;
+      }
+    }
+    const ttlMs = normalizeWorkerTokenRotationTtlMs(input.ttlMs);
+    const requestedRotationExpiryMs = Date.now() + ttlMs;
+    const currentExpiryMs = current.expiresAt ? Date.parse(current.expiresAt) : Number.POSITIVE_INFINITY;
+    const rotationExpiresAt = new Date(Math.min(requestedRotationExpiryMs, currentExpiryMs)).toISOString();
+    const record = {
+      id: newId('wtok'),
+      workerId,
+      label: current.label ? `${current.label} (rotated)` : 'rotated Worker token',
+      publicKey: current.publicKey,
+      enrollmentTokenId: current.enrollmentTokenId || null,
+      tokenHash,
+      tokenPreview: token.slice(-8),
+      createdAt: now,
+      lastUsedAt: null,
+      expiresAt: rotationExpiresAt,
+      revokedAt: null,
+      rotationStatus: 'pending',
+      rotationFromTokenId: current.id,
+      rotationToTokenId: null,
+      rotationExpiresAt,
+      rotationFinalExpiresAt: current.expiresAt || null,
+      rotationConfirmedAt: null,
+      rotationExpiredAt: null,
+      rotationSupersededAt: null,
+    };
+    current.rotationToTokenId = record.id;
+    this.state.workerTokens[record.id] = record;
+    this.state.workerTokenOrder.push(record.id);
+    await this.save();
+    return {
+      workerToken: publicWorkerToken(record),
+      previousWorkerToken: publicWorkerToken(current),
+      idempotent: false,
+    };
+  }
+
+  async confirmWorkerTokenRotation(workerId, replacementTokenId) {
+    const replacement = this.state.workerTokens[replacementTokenId];
+    if (!replacement || replacement.workerId !== workerId || !replacement.rotationFromTokenId) {
+      throw workerTokenRotationError('Replacement Worker token is not a rotation token for this Worker', 409);
+    }
+    if (replacement.rotationStatus === 'confirmed') {
+      const previous = this.state.workerTokens[replacement.rotationFromTokenId] || null;
+      return {
+        workerToken: publicWorkerToken(replacement),
+        previousWorkerToken: previous ? publicWorkerToken(previous) : null,
+        idempotent: true,
+      };
+    }
+    if (replacement.rotationStatus !== 'pending' || replacement.revokedAt) {
+      throw workerTokenRotationError(`Worker token rotation is ${replacement.rotationStatus || 'inactive'}`, 409);
+    }
+    if (replacement.rotationExpiresAt && Date.parse(replacement.rotationExpiresAt) <= Date.now()) {
+      await this.expirePendingWorkerTokenRotations();
+      throw workerTokenRotationError('Worker token rotation confirmation window has expired', 410);
+    }
+    const previous = this.state.workerTokens[replacement.rotationFromTokenId];
+    if (!previous || previous.workerId !== workerId) {
+      throw workerTokenRotationError('Previous Worker token record is missing or has a different owner', 409);
+    }
+
+    const now = nowIso();
+    replacement.rotationStatus = 'confirmed';
+    replacement.rotationConfirmedAt = replacement.rotationConfirmedAt || now;
+    replacement.expiresAt = replacement.rotationFinalExpiresAt || null;
+    for (const pending of Object.values(this.state.workerTokens)) {
+      if (
+        pending.id !== replacement.id
+        && pending.rotationStatus === 'pending'
+        && pending.rotationFromTokenId === previous.id
+      ) {
+        pending.rotationStatus = 'superseded';
+        pending.rotationSupersededAt = pending.rotationSupersededAt || now;
+        pending.revokedAt = pending.revokedAt || now;
+      }
+    }
+    previous.rotationToTokenId = replacement.id;
+    previous.revokedAt = previous.revokedAt || now;
+    await this.save();
+    return {
+      workerToken: publicWorkerToken(replacement),
+      previousWorkerToken: publicWorkerToken(previous),
+      idempotent: false,
+    };
   }
 
   async rememberWorkerRequestNonce(workerTokenId, nonce, timestampMs, windowMs = 5 * 60_000) {
@@ -633,6 +1330,7 @@ export class JsonStore {
       candidate.tokenHash === tokenHash
       && !candidate.revokedAt
       && (!candidate.expiresAt || Date.parse(candidate.expiresAt) > Date.now())
+      && (candidate.rotationStatus !== 'expired')
     ));
     if (!record) {
       return null;
@@ -642,23 +1340,54 @@ export class JsonStore {
       type: 'worker',
       workerId: record.workerId,
       workerTokenId: record.id,
+      workerTokenRotationStatus: record.rotationStatus || null,
     };
   }
 
-  async heartbeat(workerId, input = {}) {
+  async heartbeat(workerId, input = {}, authentication = null, connection = null) {
     const worker = this.state.workers[workerId];
     if (!worker) {
       throw new Error(`Unknown worker: ${workerId}`);
     }
+    const now = nowIso();
+    const nowMs = Date.parse(now);
+    const previousLastSeenAt = worker.lastSeenAt || null;
+    const previousRuntime = normalizeWorkerRuntime(worker.runtime);
+    const reportedRuntime = normalizeWorkerRuntime(input.runtime);
+    const reportedLeases = new Map((Array.isArray(input.taskLeases) ? input.taskLeases : [])
+      .filter((item) => item?.taskId)
+      .map((item) => [item.taskId, item]));
     const reportedTaskIds = normalizeTaskIds(input.currentTaskIds ?? worker.currentTaskIds, input.currentTaskId ?? null);
     const currentTaskIds = reportedTaskIds.filter((taskId) => {
       const task = this.state.tasks[taskId];
-      return task?.status === 'running' && task.assignedWorkerId === workerId;
+      const reportedLease = reportedLeases.get(taskId);
+      return task?.status === 'running'
+        && task.assignedWorkerId === workerId
+        && (!reportedLease?.attemptId || reportedLease.attemptId === task.currentAttemptId)
+        && !leaseExpired(task, nowMs);
     });
+    for (const taskId of currentTaskIds) {
+      const task = this.state.tasks[taskId];
+      const durationMs = normalizeTaskLeaseMs(task.lease?.durationMs, this.taskLeaseMs);
+      const expiresAt = new Date(nowMs + durationMs).toISOString();
+      task.lease = {
+        attemptId: task.currentAttemptId,
+        workerId,
+        acquiredAt: task.lease?.acquiredAt || now,
+        renewedAt: now,
+        expiresAt,
+        durationMs,
+      };
+      const attempt = (task.attempts || []).find((item) => item.id === task.currentAttemptId);
+      if (attempt) {
+        attempt.leaseRenewedAt = now;
+        attempt.leaseExpiresAt = expiresAt;
+      }
+    }
     const hasRunningAssignedTask = Object.values(this.state.tasks)
       .some((task) => task.status === 'running' && task.assignedWorkerId === workerId);
     const staleRunningHeartbeat = input.observedState === 'running' && !currentTaskIds.length && !hasRunningAssignedTask;
-    worker.lastSeenAt = nowIso();
+    worker.lastSeenAt = now;
     worker.maxConcurrency = maxConcurrency(input.maxConcurrency || worker.maxConcurrency);
     worker.currentTaskIds = currentTaskIds;
     worker.currentTaskId = worker.currentTaskIds[0] || null;
@@ -671,6 +1400,34 @@ export class JsonStore {
     }
     worker.metrics = input.metrics || worker.metrics || {};
     worker.inventory = input.inventory || worker.inventory || {};
+    if (reportedRuntime && reportedRuntime.id !== previousRuntime?.id) {
+      this.appendWorkerEvent(worker, {
+        at: now,
+        type: 'runtime_started',
+        level: 'info',
+        message: `Worker ${workerId} runtime ${reportedRuntime.id} connected`,
+        data: {
+          controlObserved: true,
+          runtimeId: reportedRuntime.id,
+          runtimeStartedAt: reportedRuntime.startedAt,
+          pid: reportedRuntime.pid,
+          previousRuntimeId: previousRuntime?.id || null,
+          previousRuntimeStartedAt: previousRuntime?.startedAt || null,
+          previousLastSeenAt,
+          authenticationType: authentication?.type || null,
+          workerTokenId: authentication?.workerTokenId || null,
+        },
+      });
+    }
+    worker.runtime = reportedRuntime?.id !== previousRuntime?.id
+      ? (reportedRuntime || previousRuntime)
+      : (previousRuntime || reportedRuntime);
+    if (authentication) {
+      worker.identity = { ...authentication };
+    }
+    if (connection) {
+      worker.connection = { ...connection };
+    }
     await this.save();
     return {
       worker: this.decorateWorker(worker),
@@ -686,10 +1443,17 @@ export class JsonStore {
 
   getStatusSnapshot() {
     const workers = this.listWorkers();
+    const workerById = new Map(workers.map((worker) => [worker.id, worker]));
     const workerItems = workers.map(compactWorkerSnapshot);
     const sessions = this.listSessions();
     const tasks = this.listTasks();
-    const taskItems = tasks.map(compactTaskSnapshot);
+    const taskItems = tasks.map((task) => {
+      const workerId = task.assignedWorkerId || task.requestedWorkerId || null;
+      return compactTaskSnapshot(task, buildTaskRuntimeDiagnostics(task, {
+        worker: workerById.get(workerId) || null,
+        session: task.sessionId ? this.state.sessions[task.sessionId] || null : null,
+      }));
+    });
     const batches = this.listBatches();
     const taskCounts = tasks.reduce((acc, task) => {
       acc[task.status] = (acc[task.status] || 0) + 1;
@@ -699,8 +1463,18 @@ export class JsonStore {
       acc[batch.status] = (acc[batch.status] || 0) + 1;
       return acc;
     }, {});
-    const attentionTasks = tasks.filter(taskNeedsAttention);
+    const attentionTasks = taskItems.filter(taskNeedsAttention);
+    const routingIssues = attentionTasks.filter((task) => Boolean(task.routingNextAction));
+    const operationalIssues = attentionTasks.filter((task) => task.runtimeDiagnostics?.needsAttention);
     return {
+      storage: {
+        backend: this.backend,
+        stateVersion: this.state.version,
+        sqliteSchemaVersion: this.backend === 'sqlite' ? this.schemaVersion : null,
+        migration: this.lastMigration || null,
+        schemaMigration: this.lastSchemaMigration || null,
+        restoreReceipt: this.restoreReceipt || null,
+      },
       workers: {
         total: workerItems.length,
         active: workerItems.filter((worker) => worker.active).length,
@@ -721,7 +1495,8 @@ export class JsonStore {
         counts: taskCounts,
         attention: {
           total: attentionTasks.length,
-          routingIssues: attentionTasks.length,
+          routingIssues: routingIssues.length,
+          operationalIssues: operationalIssues.length,
           items: attentionTasks.slice(0, 20).map(attentionTaskSummary),
         },
         items: taskItems,
@@ -746,6 +1521,7 @@ export class JsonStore {
       requiredCapabilities: Array.from(new Set(input.requiredCapabilities || [])),
       requiredTools: normalizeToolList(input.requiredTools || input.tools),
       requiredLabels: normalizeLabels(input.requiredLabels),
+      requiredResources: normalizeResourceRequirements(input.requiredResources || input.resources),
       labels: input.labels || {},
       createdAt: now,
       updatedAt: now,
@@ -825,13 +1601,15 @@ export class JsonStore {
     }, {});
     const terminal = tasks.filter((task) => terminalTaskStatus(task.status)).length;
     let status = 'queued';
-    const active = (counts.queued || 0) + (counts.running || 0);
+    const active = (counts.queued || 0) + (counts.running || 0) + (counts.uploading_inputs || 0);
     if (tasks.length && terminal === tasks.length) {
       status = (counts.failed || counts.cancelled) ? 'completed_with_errors' : 'succeeded';
     } else if (!active && (counts.failed || counts.cancelled || counts.blocked)) {
       status = 'completed_with_errors';
     } else if (counts.running) {
       status = 'running';
+    } else if (counts.uploading_inputs) {
+      status = 'uploading_inputs';
     } else if (counts.queued) {
       status = 'queued';
     } else if (counts.blocked) {
@@ -1031,10 +1809,11 @@ export class JsonStore {
         if (artifact.skipped || !artifact.storagePath || !dependencyArtifactAllowed(artifact.path, policy)) {
           continue;
         }
-        const bytes = await fs.readFile(artifact.storagePath);
         files.push({
           path: `${policy.prefix}/${dependencyLabel}/${artifact.path}`,
-          contentBase64: bytes.toString('base64'),
+          size: artifact.size,
+          sha256: artifact.sha256,
+          transfer: 'stored_reference',
           sourceTaskId: dependency.id,
           sourceBatchKey: dependency.batchKey || null,
           sourceArtifactId: artifact.id,
@@ -1390,6 +2169,7 @@ export class JsonStore {
         requiredTools: options.requiredTools,
         slots: options.slots,
         requiredLabels: options.requiredLabels,
+        requiredResources: options.requiredResources,
         reason: options.reason || 'Batch retry failed tasks',
         touchWorker: false,
       });
@@ -1428,6 +2208,14 @@ export class JsonStore {
     const runningSlots = running.reduce((sum, task) => sum + taskSlotCost(task), 0);
     const reservedSlots = reserved.reduce((sum, task) => sum + taskSlotCost(task), 0);
     const capacity = maxConcurrency(worker.maxConcurrency);
+    const hardwareCapacity = workerResourceCapacity(worker);
+    const hardwareUsed = workerResourceUsage(worker, [...running, ...reserved]);
+    const hardwareAvailable = {
+      cpuCores: Math.max(0, hardwareCapacity.cpuCores - hardwareUsed.cpuCores),
+      memoryBytes: Math.max(0, hardwareCapacity.memoryBytes - hardwareUsed.memoryBytes),
+      gpuCount: Math.max(0, hardwareCapacity.gpuCount - hardwareUsed.gpuCount),
+      gpuMemoryBytes: Math.max(0, hardwareCapacity.gpuMemoryBytes - hardwareUsed.gpuMemoryBytes),
+    };
     return {
       ...worker,
       gatewayState: this.gatewayState(worker, ageMs),
@@ -1439,13 +2227,32 @@ export class JsonStore {
       runningSlots,
       reservedSlots,
       availableSlots: Math.max(0, capacity - runningSlots - reservedSlots),
-      resources: workerResourceDiagnostics(worker),
+      resources: {
+        ...workerResourceDiagnostics(worker),
+        reservations: {
+          capacity: {
+            cpuCores: hardwareCapacity.cpuCores,
+            memoryBytes: hardwareCapacity.memoryBytes,
+            gpuCount: hardwareCapacity.gpuCount,
+            gpuMemoryBytes: hardwareCapacity.gpuMemoryBytes,
+          },
+          used: hardwareUsed,
+          available: hardwareAvailable,
+        },
+      },
       readiness: workerReadinessDiagnostics(worker),
     };
   }
 
   appendWorkerEvent(worker, event = {}) {
+    worker.events = normalizeWorkerEvents(worker.events);
+    const eventId = String(event.id || '').trim().slice(0, 120) || newId('wev');
+    const existing = worker.events.find((candidate) => candidate.id === eventId);
+    if (existing) {
+      return existing;
+    }
     const item = {
+      id: eventId,
       at: event.at || nowIso(),
       type: event.type || 'log',
       level: event.level || 'info',
@@ -1453,7 +2260,6 @@ export class JsonStore {
       workerId: worker.id,
       data: event.data || undefined,
     };
-    worker.events = normalizeWorkerEvents(worker.events);
     worker.events.push(item);
     if (worker.events.length > 300) {
       worker.events = worker.events.slice(worker.events.length - 300);
@@ -1466,30 +2272,122 @@ export class JsonStore {
     if (!worker) {
       throw new Error(`Unknown worker: ${workerId}`);
     }
+    if (CONTROL_ONLY_WORKER_EVENT_TYPES.has(event.type)) {
+      const error = new Error(`Worker event type ${event.type} is reserved for control-observed events`);
+      error.status = 400;
+      throw error;
+    }
     const item = this.appendWorkerEvent(worker, event);
     worker.lastEventAt = item.at;
     if (item.type === 'agent_self_test') {
       worker.diagnostics ??= {};
       worker.diagnostics.agentSelfTest = {
         at: item.at,
-        status: event.data?.status || 'unknown',
-        taskId: event.data?.taskId || null,
-        exitCode: event.data?.exitCode ?? null,
-        error: event.data?.error || null,
+        status: item.data?.status || 'unknown',
+        taskId: item.data?.taskId || null,
+        exitCode: item.data?.exitCode ?? null,
+        error: item.data?.error || null,
       };
     }
     if (item.type === 'self_test') {
       worker.diagnostics ??= {};
       worker.diagnostics.selfTest = {
         at: item.at,
-        status: event.data?.status || 'unknown',
-        taskId: event.data?.taskId || null,
-        exitCode: event.data?.exitCode ?? null,
-        error: event.data?.error || null,
+        status: item.data?.status || 'unknown',
+        taskId: item.data?.taskId || null,
+        exitCode: item.data?.exitCode ?? null,
+        error: item.data?.error || null,
       };
+    }
+    const taskId = String(item.data?.taskId || '').trim();
+    const task = taskId ? this.state.tasks[taskId] : null;
+    const attemptId = String(item.data?.attemptId || '').trim() || null;
+    const attempt = attemptId
+      ? task?.attempts?.find((candidate) => candidate.id === attemptId) || null
+      : null;
+    const workerBoundToTask = Boolean(
+      task
+      && (
+        task.assignedWorkerId === workerId
+        || task.requestedWorkerId === workerId
+        || task.attempts?.some((candidate) => candidate.workerId === workerId)
+      )
+    );
+    let taskEvent = null;
+    if (
+      workerBoundToTask
+      && item.type === 'command_applied'
+      && item.data?.action === 'cancel_current'
+    ) {
+      taskEvent = {
+        type: 'worker_cancel_applied',
+        message: `Worker ${workerId} applied cancel_current`,
+        workerId,
+        attemptId,
+        data: { workerEventId: item.id },
+      };
+    } else if (
+      workerBoundToTask
+      && item.type === 'task_released'
+      && attempt?.workerId === workerId
+    ) {
+      taskEvent = {
+        type: 'worker_process_released',
+        message: `Worker ${workerId} released task process`,
+        workerId,
+        attemptId,
+        data: { workerEventId: item.id },
+      };
+    }
+    if (taskEvent && !task.events?.some((candidate) => (
+      candidate.type === taskEvent.type
+      && candidate.workerId === workerId
+      && (candidate.attemptId || null) === attemptId
+    ))) {
+      task.events ??= [];
+      task.events.push({ at: item.at, ...taskEvent });
     }
     await this.save();
     return item;
+  }
+
+  async addAuditEvent(event = {}) {
+    const item = {
+      id: event.id || newId('audit'),
+      at: event.at || nowIso(),
+      requestId: String(event.requestId || '').slice(0, 80) || null,
+      actorType: String(event.actorType || 'anonymous').slice(0, 40),
+      actorId: String(event.actorId || '').slice(0, 120) || null,
+      method: String(event.method || '').slice(0, 16).toUpperCase(),
+      path: String(event.path || '').slice(0, 500),
+      statusCode: Number(event.statusCode || 0),
+      outcome: event.outcome === 'denied' || event.outcome === 'error' ? event.outcome : 'success',
+      remoteAddress: String(event.remoteAddress || '').slice(0, 120) || null,
+      userAgent: String(event.userAgent || '').slice(0, 300) || null,
+      durationMs: Math.max(0, Number(event.durationMs || 0)),
+      error: String(event.error || '').slice(0, 500) || null,
+    };
+    this.state.auditEvents.push(item);
+    if (this.state.auditEvents.length > 5_000) {
+      this.state.auditEvents = this.state.auditEvents.slice(-5_000);
+    }
+    await this.save();
+    return item;
+  }
+
+  listAuditEvents(options = {}) {
+    const tail = Math.max(0, Math.min(1_000, Number(options.tail ?? 100)));
+    const actorType = options.actorType ? String(options.actorType) : null;
+    const outcome = options.outcome ? String(options.outcome) : null;
+    const statusCode = options.statusCode === undefined || options.statusCode === null
+      ? null
+      : Number(options.statusCode);
+    const filtered = this.state.auditEvents.filter((event) => (
+      (!actorType || event.actorType === actorType)
+      && (!outcome || event.outcome === outcome)
+      && (statusCode === null || event.statusCode === statusCode)
+    ));
+    return tail ? filtered.slice(-tail) : [];
   }
 
   listWorkerEvents(workerId, options = {}) {
@@ -1528,7 +2426,17 @@ export class JsonStore {
   }
 
   async createTask(input) {
+    const idempotencyKey = String(input.idempotencyKey || '').trim() || null;
+    if (idempotencyKey) {
+      const existing = this.listTasks().find((candidate) => candidate.idempotencyKey === idempotencyKey
+        && (candidate.batchId || null) === (input.batchId || null)
+        && (candidate.sessionId || null) === (input.sessionId || null));
+      if (existing) {
+        return existing;
+      }
+    }
     const now = nowIso();
+    const retryBackoffMs = normalizeRetryBackoffMs(input.retryBackoffMs);
     const task = {
       id: newId('task'),
       title: input.title || input.command || input.prompt || 'untitled task',
@@ -1549,23 +2457,37 @@ export class JsonStore {
       requiredCapabilities: Array.from(new Set(input.requiredCapabilities || [])),
       requiredTools: normalizeToolList(input.requiredTools || input.tools),
       requiredLabels: normalizeLabels(input.requiredLabels || input.labels),
+      requiredResources: normalizeResourceRequirements(input.requiredResources || input.resources),
       env: normalizeEnv(input.env),
       sandboxProfile: normalizeSandboxProfile(input.sandboxProfile ?? input.sandbox),
       artifactPolicy: normalizeArtifactPolicy(input.artifactPolicy),
       dependencyArtifacts: normalizeDependencyArtifacts(input.dependencyArtifacts),
       dependencyInputFiles: [],
       inputFiles: input.inputFiles || [],
+      inputReadyStatus: null,
       attemptSeq: Number(input.attemptSeq || 0),
       currentAttemptId: input.currentAttemptId || null,
       attempts: Array.isArray(input.attempts) ? input.attempts : [],
+      maxAttempts: normalizeMaxAttempts(input.maxAttempts),
+      retryPolicy: normalizeRetryPolicy(input.retryPolicy, { strict: true }),
+      retryBackoffMs,
+      maxRetryBackoffMs: Math.max(
+        retryBackoffMs,
+        normalizeRetryBackoffMs(input.maxRetryBackoffMs, DEFAULT_MAX_RETRY_BACKOFF_MS),
+      ),
+      notBeforeAt: input.notBeforeAt || null,
+      lease: null,
+      idempotencyKey,
       keepWorkspace: typeof input.keepWorkspace === 'boolean' ? input.keepWorkspace : undefined,
       timeoutMs: Number(input.timeoutMs || 10 * 60 * 1000),
       maxOutputChars: Number(input.maxOutputChars || 80_000),
+      createdControlInstanceId: String(input.controlInstanceId || '').trim() || null,
       createdAt: now,
       updatedAt: now,
       startedAt: null,
       completedAt: null,
       exitCode: null,
+      failureKind: null,
       stdout: '',
       stderr: '',
       error: null,
@@ -1596,6 +2518,9 @@ export class JsonStore {
       task.requiredLabels = Object.keys(task.requiredLabels).length
         ? task.requiredLabels
         : { ...(session.requiredLabels || {}) };
+      task.requiredResources = resourceRequirementsEmpty(task.requiredResources)
+        ? { ...(session.requiredResources || {}) }
+        : task.requiredResources;
       session.taskIds.push(task.id);
       session.updatedAt = now;
       session.events.push({
@@ -1621,7 +2546,15 @@ export class JsonStore {
       }
     }
 
-    if (task.status === 'blocked') {
+    await this.initializeTaskInputUploads(task);
+
+    if (task.status === 'uploading_inputs') {
+      task.scheduler = {
+        workerId: null,
+        reason: 'waiting for control-side input uploads',
+        candidates: [],
+      };
+    } else if (task.status === 'blocked') {
       task.scheduler = {
         workerId: null,
         reason: 'blocked by dependencies',
@@ -1641,7 +2574,82 @@ export class JsonStore {
     this.state.tasks[task.id] = task;
     this.state.taskOrder.push(task.id);
     await this.save();
+    this.notifyClaimWaiters();
     return task;
+  }
+
+  async initializeTaskInputUploads(task) {
+    const normalized = [];
+    let pending = 0;
+    for (const file of task.inputFiles || []) {
+      if (file.contentBase64 !== undefined) {
+        normalized.push(file);
+        continue;
+      }
+      if (file.localPath) {
+        const error = new Error(`Control-side localPath cannot be persisted in task input: ${file.path}`);
+        error.status = 400;
+        throw error;
+      }
+      if (file.transfer !== 'chunked') {
+        const error = new Error(`Input file requires contentBase64 or chunked transfer: ${file.path}`);
+        error.status = 400;
+        throw error;
+      }
+      const inputPath = String(file.path || '').replaceAll('\\', '/').replace(/^\/+/, '');
+      const size = Number(file.size);
+      const sha256 = String(file.sha256 || '').toLowerCase() || null;
+      const serverDigest = file.digestMode === 'server';
+      if (!inputPath || inputPath.includes('\0') || !Number.isSafeInteger(size) || size < 0 || (!serverDigest && !/^[a-f0-9]{64}$/.test(sha256 || ''))) {
+        const error = new Error(`Chunked input requires valid path, size, and SHA-256: ${file.path || '(missing path)'}`);
+        error.status = 400;
+        throw error;
+      }
+      const id = newId('input');
+      const dir = path.join(this.inputDir, safeName(task.id));
+      await ensureDir(dir);
+      const tempPath = path.join(dir, `${safeName(id)}.part`);
+      await fs.writeFile(tempPath, Buffer.alloc(0));
+      const now = nowIso();
+      const upload = {
+        id,
+        taskId: task.id,
+        path: inputPath,
+        size,
+        sha256,
+        digestMode: serverDigest ? 'server' : 'client',
+        status: 'pending',
+        committedBytes: 0,
+        tempPath,
+        storagePath: null,
+        createdAt: now,
+        updatedAt: now,
+        finalizedAt: null,
+      };
+      this.state.inputUploads[id] = upload;
+      this.state.inputUploadOrder.push(id);
+      normalized.push({
+        path: inputPath,
+        size,
+        sha256,
+        digestMode: serverDigest ? 'server' : 'client',
+        transfer: 'chunked',
+        inputUploadId: id,
+        ready: false,
+      });
+      pending += 1;
+    }
+    task.inputFiles = normalized;
+    if (pending) {
+      task.inputReadyStatus = task.status;
+      task.status = 'uploading_inputs';
+      task.blockedReason = `Waiting for ${pending} control-side input upload(s)`;
+      task.events = [{
+        at: task.createdAt,
+        type: 'uploading_inputs',
+        message: task.blockedReason,
+      }];
+    }
   }
 
   scheduleQueuedTask(task, now = nowIso(), eventType = 'scheduled') {
@@ -1687,6 +2695,48 @@ export class JsonStore {
       ));
   }
 
+  taskRuntimeDiagnostics(taskOrId, options = {}) {
+    const task = typeof taskOrId === 'string' ? this.getTask(taskOrId) : taskOrId;
+    const workerId = task?.assignedWorkerId || task?.requestedWorkerId || null;
+    const worker = Object.hasOwn(options, 'worker')
+      ? options.worker
+      : (workerId && this.state.workers[workerId]
+        ? this.decorateWorker(this.state.workers[workerId])
+        : null);
+    const session = Object.hasOwn(options, 'session')
+      ? options.session
+      : (task?.sessionId ? this.state.sessions[task.sessionId] || null : null);
+    return buildTaskRuntimeDiagnostics(task, {
+      worker,
+      session,
+      nowMs: options.nowMs,
+    });
+  }
+
+  decorateTask(taskOrId, options = {}) {
+    const task = typeof taskOrId === 'string' ? this.getTask(taskOrId) : taskOrId;
+    const runtimeDiagnostics = this.taskRuntimeDiagnostics(task, options);
+    const routingNextAction = routingActionHint(task);
+    return {
+      ...task,
+      nextAction: runtimeDiagnostics.nextAction || routingNextAction,
+      routingNextAction,
+      runtimeDiagnostics,
+    };
+  }
+
+  listTaskViews(options = {}) {
+    const workerById = new Map(this.listWorkers().map((worker) => [worker.id, worker]));
+    return this.listTasks().map((task) => {
+      const workerId = task.assignedWorkerId || task.requestedWorkerId || null;
+      return this.decorateTask(task, {
+        ...options,
+        worker: workerById.get(workerId) || null,
+        session: task.sessionId ? this.state.sessions[task.sessionId] || null : null,
+      });
+    });
+  }
+
   listPrunableTasks(options = {}) {
     const keep = Math.max(0, Number(options.keep ?? 20));
     const terminalStandalone = this.state.taskOrder
@@ -1705,11 +2755,41 @@ export class JsonStore {
     };
   }
 
+  dropArtifactUploadRecordsForTask(taskId) {
+    const removed = new Set(
+      this.state.artifactUploadOrder.filter((id) => this.state.artifactUploads[id]?.taskId === taskId),
+    );
+    for (const id of removed) {
+      delete this.state.artifactUploads[id];
+      this.artifactUploadQueues.delete(id);
+    }
+    if (removed.size) {
+      this.state.artifactUploadOrder = this.state.artifactUploadOrder.filter((id) => !removed.has(id));
+    }
+    return removed.size;
+  }
+
+  dropInputUploadRecordsForTask(taskId) {
+    const removed = new Set(
+      this.state.inputUploadOrder.filter((id) => this.state.inputUploads[id]?.taskId === taskId),
+    );
+    for (const id of removed) {
+      delete this.state.inputUploads[id];
+      this.inputUploadQueues.delete(id);
+    }
+    if (removed.size) {
+      this.state.inputUploadOrder = this.state.inputUploadOrder.filter((id) => !removed.has(id));
+    }
+    return removed.size;
+  }
+
   async pruneTaskHistory(options = {}) {
     const preview = this.listPrunableTasks(options);
     const pruned = [];
     for (const task of preview.tasks) {
       delete this.state.tasks[task.id];
+      this.dropArtifactUploadRecordsForTask(task.id);
+      this.dropInputUploadRecordsForTask(task.id);
       pruned.push({
         id: task.id,
         title: task.title,
@@ -1717,6 +2797,7 @@ export class JsonStore {
         completedAt: task.completedAt || null,
       });
       await fs.rm(path.join(this.artifactDir, safeName(task.id)), { recursive: true, force: true });
+      await fs.rm(path.join(this.inputDir, safeName(task.id)), { recursive: true, force: true });
     }
     if (pruned.length) {
       const removed = new Set(pruned.map((task) => task.id));
@@ -1771,6 +2852,8 @@ export class JsonStore {
         continue;
       }
       delete this.state.tasks[taskId];
+      this.dropArtifactUploadRecordsForTask(taskId);
+      this.dropInputUploadRecordsForTask(taskId);
       prunedTasks.push({
         id: task.id,
         title: task.title,
@@ -1778,6 +2861,7 @@ export class JsonStore {
         completedAt: task.completedAt || null,
       });
       await fs.rm(path.join(this.artifactDir, safeName(task.id)), { recursive: true, force: true });
+      await fs.rm(path.join(this.inputDir, safeName(task.id)), { recursive: true, force: true });
     }
     const prunedBatches = [];
     for (const batchId of batchIds) {
@@ -1817,7 +2901,7 @@ export class JsonStore {
     return task;
   }
 
-  async claimTask(workerId) {
+  async claimTask(workerId, options = {}) {
     const worker = this.state.workers[workerId];
     if (!worker) {
       throw new Error(`Unknown worker: ${workerId}`);
@@ -1825,17 +2909,69 @@ export class JsonStore {
     worker.maxConcurrency = maxConcurrency(worker.maxConcurrency);
     worker.currentTaskIds = normalizeTaskIds(worker.currentTaskIds, worker.currentTaskId);
     worker.currentTaskId = worker.currentTaskIds[0] || null;
+    const protocolReadiness = protocolReadinessForWorker(worker);
+    if (!protocolReadiness.eligible) {
+      const at = nowIso();
+      const protocolReason = protocolReadiness.reasons[0];
+      let stateChanged = false;
+      for (const task of this.listTasks()) {
+        if (task.status !== 'queued') {
+          continue;
+        }
+        const session = task.sessionId ? this.state.sessions[task.sessionId] : null;
+        const targetsWorker = task.requestedWorkerId === workerId
+          || session?.assignedWorkerId === workerId
+          || session?.requestedWorkerId === workerId;
+        const alreadyDiagnosed = (task.scheduler?.candidates || []).some((candidate) => (
+          candidate.workerId === workerId && (candidate.reasons || []).includes(protocolReason)
+        ));
+        if (!targetsWorker || alreadyDiagnosed) {
+          continue;
+        }
+        task.scheduler = scheduleTask({
+          task,
+          workers: this.listWorkers(),
+          tasks: this.listTasks(),
+          session,
+        });
+        task.updatedAt = at;
+        task.events.push({
+          at,
+          type: 'protocol_incompatible',
+          message: protocolReason,
+          workerId,
+          data: {
+            workerProtocolVersion: protocolReadiness.workerProtocolVersion,
+            controlProtocolVersion: protocolReadiness.controlProtocolVersion,
+          },
+        });
+        stateChanged = true;
+      }
+      if (options.touchWorker !== false) {
+        worker.lastSeenAt = at;
+        stateChanged = true;
+      }
+      if (stateChanged) {
+        await this.save();
+      }
+      return null;
+    }
     const runningSlots = this.listTasks()
       .filter((candidate) => candidate.assignedWorkerId === workerId && candidate.status === 'running')
       .reduce((sum, candidate) => sum + taskSlotCost(candidate), 0);
     if (runningSlots >= worker.maxConcurrency) {
-      worker.lastSeenAt = nowIso();
-      await this.save();
+      if (options.touchWorker !== false) {
+        worker.lastSeenAt = nowIso();
+        await this.save();
+      }
       return null;
     }
 
     const task = this.listTasks().find((candidate) => {
       if (candidate.status !== 'queued') {
+        return false;
+      }
+      if (candidate.notBeforeAt && Date.parse(candidate.notBeforeAt) > Date.now()) {
         return false;
       }
       if (worker.adminState !== 'enabled') {
@@ -1871,6 +3007,9 @@ export class JsonStore {
       if (!agentReadinessForTask(candidate, worker).eligible) {
         return false;
       }
+      if (!resourceFitForTask(candidate, worker, this.listTasks()).eligible) {
+        return false;
+      }
       if (runningSlots + taskSlotCost(candidate) > worker.maxConcurrency) {
         return false;
       }
@@ -1880,17 +3019,31 @@ export class JsonStore {
     });
 
     if (!task) {
-      worker.lastSeenAt = nowIso();
-      await this.save();
+      if (options.touchWorker !== false) {
+        worker.lastSeenAt = nowIso();
+        await this.save();
+      }
       return null;
     }
 
     const now = nowIso();
+    const nowMs = Date.parse(now);
     const attemptId = newId('attempt');
     task.status = 'running';
     task.assignedWorkerId = workerId;
     task.attemptSeq = Number(task.attemptSeq || 0) + 1;
     task.currentAttemptId = attemptId;
+    task.notBeforeAt = null;
+    const leaseDurationMs = normalizeTaskLeaseMs(this.taskLeaseMs);
+    const leaseExpiresAt = new Date(nowMs + leaseDurationMs).toISOString();
+    task.lease = {
+      attemptId,
+      workerId,
+      acquiredAt: now,
+      renewedAt: now,
+      expiresAt: leaseExpiresAt,
+      durationMs: leaseDurationMs,
+    };
     task.attempts ??= [];
     task.attempts.push({
       id: attemptId,
@@ -1899,6 +3052,8 @@ export class JsonStore {
       claimedAt: now,
       completedAt: null,
       status: 'running',
+      leaseRenewedAt: now,
+      leaseExpiresAt,
     });
     task.startedAt = now;
     task.updatedAt = now;
@@ -1940,8 +3095,11 @@ export class JsonStore {
         attemptSeq: task.attemptSeq,
       },
     });
+    const claimedResult = options.snapshotResult
+      ? JSON.parse(JSON.stringify(task))
+      : task;
     await this.save();
-    return task;
+    return claimedResult;
   }
 
   getWorker(workerId) {
@@ -1958,7 +3116,7 @@ export class JsonStore {
       throw new Error(`Unknown worker: ${workerId}`);
     }
     const now = nowIso();
-    const allowed = new Set(['pause', 'resume', 'drain', 'shutdown', 'cancel_current']);
+    const allowed = new Set(['pause', 'resume', 'drain', 'shutdown', 'cancel_current', 'rotate_token']);
     if (!allowed.has(action)) {
       throw new Error(`Unsupported worker action: ${action}`);
     }
@@ -1998,6 +3156,7 @@ export class JsonStore {
       },
     });
     await this.save();
+    this.notifyClaimWaiters();
     return { worker: this.decorateWorker(worker), command };
   }
 
@@ -2040,7 +3199,7 @@ export class JsonStore {
     };
   }
 
-  async acknowledgeCommand(workerId, commandId, status = 'acknowledged', message = '') {
+  async acknowledgeCommand(workerId, commandId, status = 'acknowledged', message = '', result = null) {
     const worker = this.state.workers[workerId];
     if (!worker) {
       throw new Error(`Unknown worker: ${workerId}`);
@@ -2052,6 +3211,7 @@ export class JsonStore {
     const now = nowIso();
     command.status = status;
     command.message = message;
+    command.result = result && typeof result === 'object' && !Array.isArray(result) ? result : null;
     if (!command.acknowledgedAt) {
       command.acknowledgedAt = now;
     }
@@ -2068,6 +3228,7 @@ export class JsonStore {
         action: command.action,
         status,
         message,
+        result: command.result,
       },
     });
     await this.save();
@@ -2076,8 +3237,31 @@ export class JsonStore {
 
   async addTaskEvent(taskId, event) {
     const task = this.getTask(taskId);
+    const suppliedEventId = String(event.id || '').trim().slice(0, 120) || null;
+    if (suppliedEventId) {
+      const existing = task.events.find((candidate) => candidate.id === suppliedEventId);
+      if (existing) {
+        return existing;
+      }
+    }
+    if (task.status === 'running' && leaseExpired(task)) {
+      return {
+        id: suppliedEventId,
+        at: event.at || nowIso(),
+        type: 'expired_lease_event_ignored',
+        message: 'Ignored event because the task attempt lease expired',
+        workerId: event.workerId || task.assignedWorkerId || null,
+        data: {
+          currentAttemptId: task.currentAttemptId || null,
+          eventAttemptId: event.attemptId || null,
+          leaseExpiresAt: task.lease?.expiresAt || null,
+        },
+        ignored: true,
+      };
+    }
     if (task.currentAttemptId && event.attemptId !== task.currentAttemptId) {
       return {
+        id: suppliedEventId,
         at: event.at || nowIso(),
         type: 'stale_event_ignored',
         message: 'Ignored event for a stale task attempt',
@@ -2090,10 +3274,12 @@ export class JsonStore {
       };
     }
     const item = {
+      id: suppliedEventId || newId('tev'),
       at: event.at || nowIso(),
       type: event.type || 'event',
       message: event.message || '',
       workerId: event.workerId || task.assignedWorkerId || null,
+      attemptId: event.attemptId || null,
       data: event.data || undefined,
     };
     task.events.push(item);
@@ -2122,6 +3308,21 @@ export class JsonStore {
       await this.save();
       return task;
     }
+    if (leaseExpired(task, Date.parse(now))) {
+      task.events.push({
+        at: now,
+        type: 'expired_lease_result_ignored',
+        message: 'Ignored result because the task attempt lease expired',
+        workerId: task.assignedWorkerId,
+        data: {
+          currentAttemptId: task.currentAttemptId || null,
+          resultAttemptId: result.attemptId || null,
+          leaseExpiresAt: task.lease?.expiresAt || null,
+        },
+      });
+      await this.save();
+      return task;
+    }
     if (task.currentAttemptId && result.attemptId !== task.currentAttemptId) {
       task.events.push({
         at: now,
@@ -2136,9 +3337,87 @@ export class JsonStore {
       await this.save();
       return task;
     }
+    const completionStatus = result.status || (result.exitCode === 0 ? 'succeeded' : 'failed');
+    const failureKind = normalizeTaskFailureKind(result.failureKind)
+      || (completionStatus === 'cancelled' ? 'cancelled' : completionStatus === 'failed' ? 'nonzero_exit' : null);
+    const retryMatch = completionStatus === 'failed'
+      ? retryPolicyMatch(task.retryPolicy, { exitCode: result.exitCode, failureKind })
+      : { matched: false };
+    const retryExhausted = retryMatch.matched
+      && Number(task.attemptSeq || 0) >= normalizeMaxAttempts(task.maxAttempts);
+    if (retryMatch.matched && !retryExhausted) {
+      const previousWorkerId = task.assignedWorkerId;
+      const previousAttemptId = task.currentAttemptId;
+      const attempt = (task.attempts || []).find((item) => item.id === previousAttemptId);
+      if (attempt) {
+        attempt.exitCode = result.exitCode ?? null;
+        attempt.failureKind = failureKind;
+      }
+      const delayMs = retryDelayMs(task);
+      const notBeforeAt = delayMs ? new Date(Date.parse(now) + delayMs).toISOString() : null;
+      const preserveExplicitWorker = String(task.scheduler?.reason || '').startsWith('explicit worker');
+      const matchedReason = retryMatch.matchedFailureKind || `exit code ${retryMatch.matchedExitCode}`;
+      const retryReason = `Retryable ${matchedReason} failure on attempt ${task.attemptSeq}/${task.maxAttempts}`;
+      this.resetTaskForRetry(task, {
+        now,
+        workerId: preserveExplicitWorker ? task.requestedWorkerId : undefined,
+        attemptStatus: 'retryable_failure',
+        reason: retryReason,
+        notBeforeAt,
+      });
+      task.events.push({
+        at: now,
+        type: 'retry_scheduled',
+        message: retryReason,
+        workerId: previousWorkerId,
+        data: {
+          attemptId: previousAttemptId,
+          attemptSeq: task.attemptSeq,
+          maxAttempts: task.maxAttempts,
+          exitCode: result.exitCode ?? null,
+          failureKind,
+          matchedFailureKind: retryMatch.matchedFailureKind,
+          matchedExitCode: retryMatch.matchedExitCode,
+          retryDelayMs: delayMs,
+          notBeforeAt,
+        },
+      });
+      const worker = previousWorkerId ? this.state.workers[previousWorkerId] : null;
+      if (worker) {
+        this.appendWorkerEvent(worker, {
+          at: now,
+          type: 'task_retry_scheduled',
+          level: 'warning',
+          message: `Task ${task.id} scheduled for retry`,
+          data: {
+            taskId: task.id,
+            attemptId: previousAttemptId,
+            exitCode: result.exitCode ?? null,
+            failureKind,
+            retryDelayMs: delayMs,
+          },
+        });
+      }
+      if (task.sessionId) {
+        const session = this.getSession(task.sessionId);
+        session.updatedAt = now;
+        session.events.push({
+          at: now,
+          type: 'task_retry_scheduled',
+          message: `Task ${task.id} scheduled for retry on the session Worker`,
+          taskId: task.id,
+          workerId: session.assignedWorkerId || previousWorkerId,
+        });
+      }
+      await this.refreshBatchDependencyStates(task.batchId, now);
+      await this.save();
+      this.notifyClaimWaiters();
+      return task;
+    }
     const artifacts = await this.saveArtifacts(task.id, result.artifacts || []);
-    task.status = result.status || (result.exitCode === 0 ? 'succeeded' : 'failed');
+    task.status = completionStatus;
     task.exitCode = result.exitCode ?? null;
+    task.failureKind = failureKind;
     task.stdout = result.stdout || '';
     task.stderr = result.stderr || '';
     task.error = result.error || null;
@@ -2152,6 +3431,7 @@ export class JsonStore {
       attempt.completedAt = now;
       attempt.status = task.status;
       attempt.exitCode = task.exitCode;
+      attempt.failureKind = failureKind;
     }
     task.events.push({
       at: now,
@@ -2162,6 +3442,23 @@ export class JsonStore {
         attemptId: task.currentAttemptId || null,
       },
     });
+    if (retryExhausted) {
+      task.events.push({
+        at: now,
+        type: 'retry_exhausted',
+        message: `Retry policy matched, but maximum attempts were exhausted (${task.attemptSeq}/${task.maxAttempts})`,
+        workerId: task.assignedWorkerId,
+        data: {
+          attemptId: task.currentAttemptId || null,
+          attemptSeq: task.attemptSeq,
+          maxAttempts: task.maxAttempts,
+          exitCode: task.exitCode,
+          failureKind,
+          matchedFailureKind: retryMatch.matchedFailureKind,
+          matchedExitCode: retryMatch.matchedExitCode,
+        },
+      });
+    }
     const worker = task.assignedWorkerId ? this.state.workers[task.assignedWorkerId] : null;
     if (worker) {
       worker.currentTaskIds = normalizeTaskIds(worker.currentTaskIds, worker.currentTaskId)
@@ -2208,7 +3505,10 @@ export class JsonStore {
       await this.refreshBatchDependencyStates(task.batchId, now);
     }
     task.currentAttemptId = null;
+    task.lease = null;
+    task.notBeforeAt = null;
     await this.save();
+    this.notifyClaimWaiters();
     return task;
   }
 
@@ -2226,10 +3526,14 @@ export class JsonStore {
       }
       await this.cancelTask(task, now, options.reason || 'Cancelled by gateway task management');
       await this.save();
+      this.notifyClaimWaiters();
       return task;
     }
 
     if (action === 'requeue') {
+      if (task.status === 'uploading_inputs') {
+        throw new Error('Task is waiting for input uploads; resume or cancel the uploads instead of requeueing');
+      }
       if (task.status === 'queued') {
         throw new Error('Task is already queued');
       }
@@ -2249,11 +3553,13 @@ export class JsonStore {
         requiredTools: options.requiredTools,
         slots: options.slots,
         requiredLabels: options.requiredLabels,
+        requiredResources: options.requiredResources,
         reason: options.reason || 'Task requeued by gateway task management',
         touchWorker: activeWorker,
       });
         await this.refreshBatchDependencyStates(task.batchId, now);
       await this.save();
+      this.notifyClaimWaiters();
       return task;
     }
 
@@ -2272,6 +3578,9 @@ export class JsonStore {
       }
       if (options.requiredLabels !== undefined) {
         task.requiredLabels = normalizeLabels(options.requiredLabels);
+      }
+      if (options.requiredResources !== undefined) {
+        task.requiredResources = normalizeResourceRequirements(options.requiredResources);
       }
       const session = task.sessionId ? this.getSession(task.sessionId) : null;
       if (session?.assignedWorkerId && options.workerId && options.workerId !== session.assignedWorkerId) {
@@ -2310,6 +3619,7 @@ export class JsonStore {
         this.scheduleQueuedTask(task, now, 'rescheduled');
       }
       await this.save();
+      this.notifyClaimWaiters();
       return task;
     }
 
@@ -2348,7 +3658,10 @@ export class JsonStore {
       }
     }
     this.clearTaskRuntime(task, now);
+    this.closeCurrentAttempt(task, now, 'cancelled', reason);
     task.currentAttemptId = null;
+    task.lease = null;
+    task.notBeforeAt = null;
     if (task.batchId && this.state.batches[task.batchId]) {
       const batch = this.state.batches[task.batchId];
       batch.updatedAt = now;
@@ -2365,11 +3678,13 @@ export class JsonStore {
 
   resetTaskForRetry(task, options = {}) {
     const now = options.now || nowIso();
+    this.closeCurrentAttempt(task, now, options.attemptStatus || 'superseded', options.reason || 'Task requeued');
     this.clearTaskRuntime(task, now, { touchWorker: options.touchWorker });
     task.assignedWorkerId = null;
     task.startedAt = null;
     task.completedAt = null;
     task.exitCode = null;
+    task.failureKind = null;
     task.stdout = '';
     task.stderr = '';
     task.error = null;
@@ -2377,6 +3692,8 @@ export class JsonStore {
     task.workspaceCleaned = false;
     task.artifacts = [];
     task.currentAttemptId = null;
+    task.lease = null;
+    task.notBeforeAt = options.notBeforeAt || null;
     if (options.workerId !== undefined) {
       task.requestedWorkerId = options.workerId || null;
     } else {
@@ -2393,6 +3710,9 @@ export class JsonStore {
     }
     if (options.requiredLabels !== undefined) {
       task.requiredLabels = normalizeLabels(options.requiredLabels);
+    }
+    if (options.requiredResources !== undefined) {
+      task.requiredResources = normalizeResourceRequirements(options.requiredResources);
     }
     task.updatedAt = now;
     task.events.push({
@@ -2421,6 +3741,7 @@ export class JsonStore {
   }
 
   listOfflineRunningTasks(options = {}) {
+    const minOfflineMs = Math.max(ACTIVE_WINDOW_MS + 1, Number(options.minOfflineMs || 0));
     return this.listTasks()
       .filter((task) => {
         if (task.status !== 'running' || !task.assignedWorkerId) {
@@ -2431,7 +3752,7 @@ export class JsonStore {
         }
         const worker = this.state.workers[task.assignedWorkerId];
         const lastSeen = worker?.lastSeenAt ? Date.parse(worker.lastSeenAt) : 0;
-        return !lastSeen || Date.now() - lastSeen > ACTIVE_WINDOW_MS;
+        return !lastSeen || Date.now() - lastSeen >= minOfflineMs;
       })
       .map((task) => {
         const worker = this.state.workers[task.assignedWorkerId] || null;
@@ -2440,8 +3761,41 @@ export class JsonStore {
           task,
           worker: worker ? this.decorateWorker(worker) : null,
           offlineMs: lastSeen ? Date.now() - lastSeen : null,
+          recoveryReason: 'worker_offline',
         };
       });
+  }
+
+  listExpiredLeaseTasks(options = {}) {
+    const atMs = Number(options.atMs || Date.now());
+    return this.listTasks()
+      .filter((task) => task.status === 'running'
+        && task.assignedWorkerId
+        && (!options.workerId || task.assignedWorkerId === options.workerId)
+        && leaseExpired(task, atMs))
+      .map((task) => {
+        const worker = this.state.workers[task.assignedWorkerId] || null;
+        const expiresAt = Date.parse(task.lease.expiresAt);
+        return {
+          task,
+          worker: worker ? this.decorateWorker(worker) : null,
+          offlineMs: worker?.lastSeenAt ? atMs - Date.parse(worker.lastSeenAt) : null,
+          leaseExpiredMs: Math.max(0, atMs - expiresAt),
+          recoveryReason: 'lease_expired',
+        };
+      });
+  }
+
+  listRecoverableRunningTasks(options = {}) {
+    const candidates = this.listOfflineRunningTasks(options);
+    const byTaskId = new Map(candidates.map((item) => [item.task.id, item]));
+    for (const item of this.listExpiredLeaseTasks(options)) {
+      const existing = byTaskId.get(item.task.id);
+      byTaskId.set(item.task.id, existing
+        ? { ...existing, leaseExpiredMs: item.leaseExpiredMs, recoveryReason: 'lease_expired_and_worker_offline' }
+        : item);
+    }
+    return [...byTaskId.values()];
   }
 
   async recoverOfflineTasks(options = {}) {
@@ -2450,17 +3804,28 @@ export class JsonStore {
     if (!allowed.has(action)) {
       throw new Error(`Unsupported recovery action: ${action}`);
     }
-    const candidates = this.listOfflineRunningTasks({ workerId: options.workerId });
+    const candidateOptions = {
+      workerId: options.workerId,
+      minOfflineMs: options.minOfflineMs,
+    };
+    const candidates = options.includeExpiredLeases === false
+      ? this.listOfflineRunningTasks(candidateOptions)
+      : this.listRecoverableRunningTasks(candidateOptions);
     if (action === 'list') {
-      return { action, candidates, recovered: [], skipped: [] };
+      return { action, candidates, recovered: [], exhausted: [], skipped: [] };
     }
 
     const now = nowIso();
     const recovered = [];
+    const exhausted = [];
     const skipped = [];
     for (const item of candidates) {
       const task = this.getTask(item.task.id);
-      if (task.sessionId && !options.includeSessions) {
+      const session = task.sessionId ? this.getSession(task.sessionId) : null;
+      const sameWorkerSessionRecovery = Boolean(
+        session && options.sessionRecovery === 'same-worker',
+      );
+      if (session && !options.includeSessions && !sameWorkerSessionRecovery) {
         skipped.push({
           task,
           reason: 'session task recovery requires --include-sessions because its worker-local session workspace may be unavailable',
@@ -2468,13 +3833,62 @@ export class JsonStore {
         continue;
       }
 
-      const session = task.sessionId ? this.getSession(task.sessionId) : null;
+      const previousWorkerId = task.assignedWorkerId;
+      const previousAttemptId = task.currentAttemptId;
+      const recoveryTargetWorkerId = sameWorkerSessionRecovery
+        ? (session.assignedWorkerId || previousWorkerId)
+        : (options.targetWorkerId || null);
+      if (
+        sameWorkerSessionRecovery
+        && (
+          session.status !== 'open'
+          || !recoveryTargetWorkerId
+          || (previousWorkerId && recoveryTargetWorkerId !== previousWorkerId)
+        )
+      ) {
+        skipped.push({
+          task,
+          reason: session.status !== 'open'
+            ? `session ${session.id} is ${session.status}; automatic recovery requires an open session`
+            : 'session Worker affinity does not match the lost task owner',
+        });
+        continue;
+      }
+      const attemptStatus = item.recoveryReason?.startsWith('lease_expired') ? 'lease_expired' : 'worker_lost';
+      if (Number(task.attemptSeq || 0) >= normalizeMaxAttempts(task.maxAttempts)) {
+        this.closeCurrentAttempt(task, now, attemptStatus, 'Execution ownership expired before completion');
+        this.clearTaskRuntime(task, now, { touchWorker: false });
+        task.status = 'failed';
+        task.completedAt = now;
+        task.updatedAt = now;
+        task.error = `Maximum attempts exhausted (${task.attemptSeq}/${task.maxAttempts}) after ${item.recoveryReason}`;
+        task.currentAttemptId = null;
+        task.lease = null;
+        task.notBeforeAt = null;
+        task.events.push({
+          at: now,
+          type: 'retry_exhausted',
+          message: task.error,
+          workerId: previousWorkerId,
+          data: {
+            attemptSeq: task.attemptSeq,
+            maxAttempts: task.maxAttempts,
+            recoveryReason: item.recoveryReason,
+          },
+        });
+        await this.refreshBatchDependencyStates(task.batchId, now);
+        exhausted.push(task);
+        continue;
+      }
+
+      this.closeCurrentAttempt(task, now, attemptStatus, options.reason || 'Execution ownership expired');
       this.clearTaskRuntime(task, now, { touchWorker: false });
       task.status = 'queued';
       task.assignedWorkerId = null;
       task.startedAt = null;
       task.completedAt = null;
       task.exitCode = null;
+      task.failureKind = null;
       task.stdout = '';
       task.stderr = '';
       task.error = null;
@@ -2482,6 +3896,9 @@ export class JsonStore {
       task.workspaceCleaned = false;
       task.artifacts = [];
       task.currentAttemptId = null;
+      task.lease = null;
+      const delayMs = retryDelayMs(task);
+      task.notBeforeAt = delayMs ? new Date(Date.parse(now) + delayMs).toISOString() : null;
       if (options.requiredCapabilities !== undefined) {
         task.requiredCapabilities = Array.from(new Set(options.requiredCapabilities || []));
       }
@@ -2494,28 +3911,48 @@ export class JsonStore {
       if (options.requiredLabels !== undefined) {
         task.requiredLabels = normalizeLabels(options.requiredLabels);
       }
-      task.requestedWorkerId = options.targetWorkerId || null;
+      if (options.requiredResources !== undefined) {
+        task.requiredResources = normalizeResourceRequirements(options.requiredResources);
+      }
+      task.requestedWorkerId = recoveryTargetWorkerId;
       if (session) {
-        session.assignedWorkerId = options.targetWorkerId || null;
-        session.requestedWorkerId = options.targetWorkerId || null;
-        session.workspace = null;
+        session.assignedWorkerId = recoveryTargetWorkerId;
+        session.requestedWorkerId = recoveryTargetWorkerId;
+        if (!sameWorkerSessionRecovery) {
+          session.workspace = null;
+        }
         session.updatedAt = now;
         session.events.push({
           at: now,
-          type: 'offline_recovered',
-          message: `Recovered offline task ${task.id}`,
+          type: item.recoveryReason?.startsWith('lease_expired') ? 'lease_recovered' : 'offline_recovered',
+          message: `Recovered task ${task.id} after ${item.recoveryReason}`,
           taskId: task.id,
-          workerId: options.targetWorkerId || null,
+          workerId: recoveryTargetWorkerId,
+          attemptId: previousAttemptId,
+          data: {
+            recoveryMode: sameWorkerSessionRecovery ? 'same-worker' : 'operator-directed',
+            workspacePreserved: sameWorkerSessionRecovery,
+          },
         });
       }
       task.updatedAt = now;
       task.events.push({
         at: now,
-        type: 'offline_recovered',
-        message: options.reason || `Recovered from offline worker ${item.worker?.id || task.assignedWorkerId || 'unknown'}`,
+        type: item.recoveryReason?.startsWith('lease_expired') ? 'lease_recovered' : 'offline_recovered',
+        message: options.reason || `Recovered after ${item.recoveryReason} on ${item.worker?.id || previousWorkerId || 'unknown'}`,
+        workerId: recoveryTargetWorkerId || previousWorkerId,
+        attemptId: previousAttemptId,
         data: {
-          previousWorkerId: item.worker?.id || item.task.assignedWorkerId,
-          targetWorkerId: options.targetWorkerId || null,
+          previousWorkerId: item.worker?.id || previousWorkerId,
+          previousAttemptId,
+          targetWorkerId: recoveryTargetWorkerId,
+          recoveryReason: item.recoveryReason,
+          sessionRecoveryMode: sameWorkerSessionRecovery ? 'same-worker' : null,
+          sessionWorkspacePreserved: sameWorkerSessionRecovery,
+          retryDelayMs: delayMs,
+          notBeforeAt: task.notBeforeAt,
+          attemptSeq: task.attemptSeq,
+          maxAttempts: task.maxAttempts,
         },
       });
       const dependencyState = this.dependencyStateForTask(task);
@@ -2526,7 +3963,9 @@ export class JsonStore {
       } else {
         task.scheduler = {
           workerId: task.requestedWorkerId,
-          reason: 'recovered to explicit worker',
+          reason: sameWorkerSessionRecovery
+            ? 'recovered to the session-affine worker'
+            : 'recovered to explicit worker',
           candidates: [],
         };
       }
@@ -2535,7 +3974,18 @@ export class JsonStore {
     }
 
     await this.save();
-    return { action, candidates, recovered, skipped };
+    this.notifyClaimWaiters();
+    return { action, candidates, recovered, exhausted, skipped };
+  }
+
+  closeCurrentAttempt(task, now = nowIso(), status = 'superseded', error = '') {
+    const attempt = (task.attempts || []).find((item) => item.id === task.currentAttemptId);
+    if (!attempt || attempt.status !== 'running') {
+      return;
+    }
+    attempt.completedAt = now;
+    attempt.status = status;
+    attempt.error = error || null;
   }
 
   clearTaskRuntime(task, now = nowIso(), options = {}) {
@@ -2565,30 +4015,587 @@ export class JsonStore {
     }
   }
 
+  getTaskInputUpload(taskId, uploadId) {
+    const upload = this.state.inputUploads[uploadId];
+    if (!upload || upload.taskId !== taskId) {
+      const error = new Error(`Unknown task input upload: ${uploadId}`);
+      error.status = 404;
+      throw error;
+    }
+    return publicInputUpload(upload);
+  }
+
+  async withInputUploadLock(uploadId, operation) {
+    const previous = this.inputUploadQueues.get(uploadId) || Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.inputUploadQueues.set(uploadId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.inputUploadQueues.get(uploadId) === current) {
+        this.inputUploadQueues.delete(uploadId);
+      }
+    }
+  }
+
+  async appendTaskInputUpload(taskId, uploadId, input = {}) {
+    return this.withInputUploadLock(uploadId, async () => {
+      const task = this.getTask(taskId);
+      const upload = this.state.inputUploads[uploadId];
+      if (!upload || upload.taskId !== taskId) {
+        const error = new Error(`Unknown task input upload: ${uploadId}`);
+        error.status = 404;
+        throw error;
+      }
+      if (task.status !== 'uploading_inputs' || upload.status !== 'pending') {
+        const error = new Error(`Task input upload is not writable: task=${task.status} upload=${upload.status}`);
+        error.status = 409;
+        error.expectedOffset = upload.committedBytes;
+        throw error;
+      }
+      const offset = Number(input.offset);
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset !== upload.committedBytes) {
+        const error = new Error(`Task input upload offset conflict: expected ${upload.committedBytes}, received ${input.offset}`);
+        error.status = 409;
+        error.expectedOffset = upload.committedBytes;
+        throw error;
+      }
+      const expectedSha256 = String(input.chunkSha256 || '').toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+        const error = new Error('Task input chunk requires a SHA-256 digest');
+        error.status = 400;
+        throw error;
+      }
+      const maxChunkBytes = Math.max(1, Number(input.maxChunkBytes || DEFAULT_MAX_ARTIFACT_CHUNK_BYTES));
+      const handle = await fs.open(upload.tempPath, 'r+');
+      const hash = crypto.createHash('sha256');
+      let written = 0;
+      try {
+        for await (const value of input.stream) {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          if (written + chunk.length > maxChunkBytes || offset + written + chunk.length > upload.size) {
+            const error = new Error(`Task input chunk exceeds allowed size (${maxChunkBytes} bytes) or declared input size`);
+            error.status = 413;
+            throw error;
+          }
+          hash.update(chunk);
+          let cursor = 0;
+          while (cursor < chunk.length) {
+            const result = await handle.write(chunk, cursor, chunk.length - cursor, offset + written + cursor);
+            cursor += result.bytesWritten;
+          }
+          written += chunk.length;
+        }
+        if (hash.digest('hex') !== expectedSha256) {
+          const error = new Error('Task input chunk SHA-256 mismatch');
+          error.status = 422;
+          throw error;
+        }
+        if (!written && upload.size > upload.committedBytes) {
+          const error = new Error('Task input chunk cannot be empty before upload completion');
+          error.status = 400;
+          throw error;
+        }
+      } catch (error) {
+        await handle.truncate(upload.committedBytes);
+        throw error;
+      } finally {
+        await handle.close();
+      }
+      upload.committedBytes += written;
+      upload.updatedAt = nowIso();
+      await this.save();
+      return publicInputUpload(upload);
+    });
+  }
+
+  async activateTaskAfterInputUploads(task, now = nowIso()) {
+    const uploads = (task.inputFiles || [])
+      .filter((file) => file.inputUploadId)
+      .map((file) => this.state.inputUploads[file.inputUploadId]);
+    if (!uploads.length || uploads.some((upload) => !upload || upload.status !== 'finalized')) {
+      return false;
+    }
+    for (const file of task.inputFiles) {
+      if (file.inputUploadId) {
+        file.ready = true;
+      }
+    }
+    task.inputReadyStatus = null;
+    const dependencyState = this.dependencyStateForTask(task);
+    if (task.dependsOnTaskIds?.length && !dependencyState.ready) {
+      this.makeTaskBlockedByDependencies(task, now, this.dependencyBlockedReason(task, dependencyState));
+    } else {
+      task.status = 'queued';
+      task.blockedReason = null;
+      task.updatedAt = now;
+      task.events.push({
+        at: now,
+        type: 'inputs_ready',
+        message: 'All control-side input uploads finalized; task queued',
+      });
+      if (!task.requestedWorkerId) {
+        this.scheduleQueuedTask(task, now, 'scheduled');
+      } else {
+        task.scheduler = scheduleTask({
+          task,
+          workers: this.listWorkers(),
+          tasks: this.listTasks(),
+          session: task.sessionId ? this.getSession(task.sessionId) : null,
+        });
+      }
+    }
+    if (task.batchId && this.state.batches[task.batchId]) {
+      const batch = this.state.batches[task.batchId];
+      batch.updatedAt = now;
+      batch.events.push({
+        at: now,
+        type: task.status === 'queued' ? 'task_inputs_ready' : 'task_blocked',
+        message: task.status === 'queued' ? `Task inputs ready: ${task.id}` : task.blockedReason,
+        taskId: task.id,
+      });
+    }
+    return true;
+  }
+
+  async finalizeTaskInputUpload(taskId, uploadId) {
+    return this.withInputUploadLock(uploadId, async () => {
+      const task = this.getTask(taskId);
+      const upload = this.state.inputUploads[uploadId];
+      if (!upload || upload.taskId !== taskId) {
+        const error = new Error(`Unknown task input upload: ${uploadId}`);
+        error.status = 404;
+        throw error;
+      }
+      if (upload.status === 'finalized') {
+        return { upload: publicInputUpload(upload), task };
+      }
+      if (task.status !== 'uploading_inputs') {
+        const error = new Error(`Task is not accepting input uploads: ${task.status}`);
+        error.status = 409;
+        throw error;
+      }
+      if (upload.committedBytes !== upload.size) {
+        const error = new Error(`Task input upload is incomplete: ${upload.committedBytes}/${upload.size}`);
+        error.status = 409;
+        error.expectedOffset = upload.committedBytes;
+        throw error;
+      }
+      const hash = crypto.createHash('sha256');
+      for await (const chunk of createReadStream(upload.tempPath)) {
+        hash.update(chunk);
+      }
+      const actualSha256 = hash.digest('hex');
+      if (upload.sha256 && actualSha256 !== upload.sha256) {
+        await fs.truncate(upload.tempPath, 0);
+        upload.committedBytes = 0;
+        upload.updatedAt = nowIso();
+        upload.lastError = 'sha256_mismatch';
+        await this.save();
+        const error = new Error('Task input SHA-256 mismatch; upload was reset for retry');
+        error.status = 422;
+        error.expectedOffset = 0;
+        throw error;
+      }
+      if (!upload.sha256) {
+        upload.sha256 = actualSha256;
+        const descriptor = task.inputFiles.find((file) => file.inputUploadId === upload.id);
+        if (descriptor) {
+          descriptor.sha256 = actualSha256;
+        }
+      }
+      const storagePath = path.join(path.dirname(upload.tempPath), `${safeName(upload.id)}.bin`);
+      await fs.rename(upload.tempPath, storagePath);
+      upload.tempPath = null;
+      upload.storagePath = storagePath;
+      upload.status = 'finalized';
+      upload.updatedAt = nowIso();
+      upload.finalizedAt = upload.updatedAt;
+      upload.lastError = null;
+      await this.activateTaskAfterInputUploads(task, upload.updatedAt);
+      await this.save();
+      this.notifyClaimWaiters();
+      return { upload: publicInputUpload(upload), task };
+    });
+  }
+
+  getTaskInputDownload(taskId, inputId, input = {}) {
+    const task = this.assertLiveArtifactUploadTask(taskId, input.attemptId, input.workerId);
+    const files = [...(task.inputFiles || []), ...(task.dependencyInputFiles || [])];
+    const descriptor = files.find((file) => file.inputUploadId === inputId || file.sourceArtifactId === inputId);
+    if (!descriptor) {
+      const error = new Error(`Task input is not attached to task ${taskId}: ${inputId}`);
+      error.status = 404;
+      throw error;
+    }
+    if (descriptor.inputUploadId) {
+      const upload = this.state.inputUploads[descriptor.inputUploadId];
+      if (!upload || upload.status !== 'finalized' || !upload.storagePath) {
+        const error = new Error(`Task input upload is not finalized: ${inputId}`);
+        error.status = 409;
+        throw error;
+      }
+      return {
+        input: { ...descriptor, size: upload.size, sha256: upload.sha256 },
+        storagePath: upload.storagePath,
+      };
+    }
+    const sourceTask = this.state.tasks[descriptor.sourceTaskId];
+    const artifact = sourceTask?.artifacts?.find((item) => item.id === descriptor.sourceArtifactId);
+    if (!artifact || artifact.skipped || !artifact.storagePath) {
+      const error = new Error(`Dependency input artifact is unavailable: ${inputId}`);
+      error.status = 404;
+      throw error;
+    }
+    return {
+      input: { ...descriptor, size: artifact.size, sha256: artifact.sha256 },
+      storagePath: artifact.storagePath,
+    };
+  }
+
   async saveArtifacts(taskId, artifacts) {
     const saved = [];
+    const task = this.getTask(taskId);
     const dir = path.join(this.artifactDir, safeName(taskId));
     await ensureDir(dir);
 
     for (const artifact of artifacts) {
+      const upload = artifact.uploadId ? this.state.artifactUploads[artifact.uploadId] : null;
+      if (artifact.uploadId && (
+        !upload
+        || upload.taskId !== taskId
+        || upload.status !== 'finalized'
+        || upload.attemptId !== task.currentAttemptId
+        || upload.workerId !== task.assignedWorkerId
+      )) {
+        const error = new Error(`Artifact upload is not finalized for task ${taskId}: ${artifact.uploadId}`);
+        error.status = 409;
+        throw error;
+      }
       const record = {
         id: newId('artifact'),
         taskId,
-        path: artifact.path,
-        size: artifact.size || 0,
-        sha256: artifact.sha256 || null,
+        path: upload?.path || artifact.path,
+        size: upload?.size ?? artifact.size ?? 0,
+        sha256: upload?.sha256 || artifact.sha256 || null,
         skipped: Boolean(artifact.skipped),
         reason: artifact.reason || null,
         storedAt: nowIso(),
       };
-      if (!record.skipped && artifact.contentBase64) {
+      if (upload) {
+        record.storagePath = upload.storagePath;
+        record.uploadId = upload.id;
+        upload.attachedArtifactId = record.id;
+        upload.attachedAt = record.storedAt;
+      } else if (!record.skipped && artifact.contentBase64) {
+        const bytes = Buffer.from(artifact.contentBase64, 'base64');
+        record.size = bytes.length;
+        record.sha256 = record.sha256 || crypto.createHash('sha256').update(bytes).digest('hex');
         const fileName = `${record.id}.bin`;
-        await fs.writeFile(path.join(dir, fileName), Buffer.from(artifact.contentBase64, 'base64'));
+        await fs.writeFile(path.join(dir, fileName), bytes);
         record.storagePath = path.join(dir, fileName);
       }
       saved.push(record);
     }
     return saved;
+  }
+
+  assertLiveArtifactUploadTask(taskId, attemptId, workerId) {
+    const task = this.getTask(taskId);
+    if (task.status !== 'running') {
+      const error = new Error(`Task is not running: ${taskId}`);
+      error.status = 409;
+      throw error;
+    }
+    if (leaseExpired(task)) {
+      const error = new Error(`Task lease expired: ${taskId}`);
+      error.status = 409;
+      throw error;
+    }
+    if (!attemptId || task.currentAttemptId !== attemptId) {
+      const error = new Error(`Artifact upload attempt is stale for task ${taskId}`);
+      error.status = 409;
+      throw error;
+    }
+    if (!workerId || task.assignedWorkerId !== workerId) {
+      const error = new Error(`Artifact upload worker does not own task ${taskId}`);
+      error.status = 403;
+      throw error;
+    }
+    return task;
+  }
+
+  async createArtifactUpload(taskId, input = {}) {
+    const task = this.assertLiveArtifactUploadTask(taskId, input.attemptId, input.workerId);
+    const artifactPath = String(input.path || '').replaceAll('\\', '/').replace(/^\/+/, '');
+    const size = Number(input.size);
+    const sha256 = String(input.sha256 || '').toLowerCase();
+    if (!artifactPath || artifactPath.includes('\0')) {
+      const error = new Error('Artifact upload requires a valid relative path');
+      error.status = 400;
+      throw error;
+    }
+    if (!Number.isSafeInteger(size) || size < 0) {
+      const error = new Error('Artifact upload requires a non-negative integer size');
+      error.status = 400;
+      throw error;
+    }
+    if (!/^[a-f0-9]{64}$/.test(sha256)) {
+      const error = new Error('Artifact upload requires a SHA-256 digest');
+      error.status = 400;
+      throw error;
+    }
+    const existing = Object.values(this.state.artifactUploads).find((upload) => (
+      upload.taskId === taskId
+      && upload.attemptId === input.attemptId
+      && upload.workerId === input.workerId
+      && upload.path === artifactPath
+      && upload.size === size
+      && upload.sha256 === sha256
+      && ['pending', 'finalized'].includes(upload.status)
+    ));
+    if (existing) {
+      return publicArtifactUpload(existing);
+    }
+
+    const id = newId('upload');
+    const dir = path.join(this.artifactDir, safeName(taskId), '.uploads');
+    await ensureDir(dir);
+    const tempPath = path.join(dir, `${safeName(id)}.part`);
+    await fs.writeFile(tempPath, Buffer.alloc(0));
+    const now = nowIso();
+    const upload = {
+      id,
+      taskId,
+      workerId: task.assignedWorkerId,
+      attemptId: task.currentAttemptId,
+      path: artifactPath,
+      size,
+      sha256,
+      status: 'pending',
+      committedBytes: 0,
+      tempPath,
+      storagePath: null,
+      createdAt: now,
+      updatedAt: now,
+      finalizedAt: null,
+      attachedArtifactId: null,
+    };
+    this.state.artifactUploads[id] = upload;
+    this.state.artifactUploadOrder.push(id);
+    await this.save();
+    return publicArtifactUpload(upload);
+  }
+
+  getArtifactUpload(taskId, uploadId, input = {}) {
+    const upload = this.state.artifactUploads[uploadId];
+    if (!upload || upload.taskId !== taskId) {
+      const error = new Error(`Unknown artifact upload: ${uploadId}`);
+      error.status = 404;
+      throw error;
+    }
+    this.assertLiveArtifactUploadTask(taskId, input.attemptId || upload.attemptId, input.workerId);
+    if (input.attemptId && upload.attemptId !== input.attemptId) {
+      const error = new Error(`Artifact upload attempt is stale: ${uploadId}`);
+      error.status = 409;
+      throw error;
+    }
+    return publicArtifactUpload(upload);
+  }
+
+  listArtifactUploads(taskId) {
+    this.getTask(taskId);
+    return this.state.artifactUploadOrder
+      .map((uploadId) => this.state.artifactUploads[uploadId])
+      .filter((upload) => upload?.taskId === taskId)
+      .map((upload) => publicArtifactUpload(upload));
+  }
+
+  async withArtifactUploadLock(uploadId, operation) {
+    const previous = this.artifactUploadQueues.get(uploadId) || Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.artifactUploadQueues.set(uploadId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.artifactUploadQueues.get(uploadId) === current) {
+        this.artifactUploadQueues.delete(uploadId);
+      }
+    }
+  }
+
+  async appendArtifactUpload(taskId, uploadId, input = {}) {
+    return this.withArtifactUploadLock(uploadId, async () => {
+      const upload = this.state.artifactUploads[uploadId];
+      if (!upload || upload.taskId !== taskId) {
+        const error = new Error(`Unknown artifact upload: ${uploadId}`);
+        error.status = 404;
+        throw error;
+      }
+      this.assertLiveArtifactUploadTask(taskId, input.attemptId, input.workerId);
+      if (upload.attemptId !== input.attemptId || upload.workerId !== input.workerId) {
+        const error = new Error(`Artifact upload ownership is stale: ${uploadId}`);
+        error.status = 409;
+        throw error;
+      }
+      if (upload.status !== 'pending') {
+        const error = new Error(`Artifact upload is already ${upload.status}: ${uploadId}`);
+        error.status = 409;
+        error.expectedOffset = upload.committedBytes;
+        throw error;
+      }
+      const offset = Number(input.offset);
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset !== upload.committedBytes) {
+        const error = new Error(`Artifact upload offset conflict: expected ${upload.committedBytes}, received ${input.offset}`);
+        error.status = 409;
+        error.expectedOffset = upload.committedBytes;
+        throw error;
+      }
+      const expectedSha256 = String(input.chunkSha256 || '').toLowerCase();
+      const expectedBodySha256 = input.bodySha256 ? String(input.bodySha256).toLowerCase() : null;
+      if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+        const error = new Error('Artifact chunk requires a SHA-256 digest');
+        error.status = 400;
+        throw error;
+      }
+      if (expectedBodySha256 && !/^[a-f0-9]{64}$/.test(expectedBodySha256)) {
+        const error = new Error('Signed artifact chunk body digest is invalid');
+        error.status = 401;
+        throw error;
+      }
+      const maxChunkBytes = Math.max(1, Number(input.maxChunkBytes || DEFAULT_MAX_ARTIFACT_CHUNK_BYTES));
+      const handle = await fs.open(upload.tempPath, 'r+');
+      const hash = crypto.createHash('sha256');
+      let written = 0;
+      try {
+        for await (const value of input.stream) {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          if (written + chunk.length > maxChunkBytes || offset + written + chunk.length > upload.size) {
+            const error = new Error(`Artifact chunk exceeds allowed size (${maxChunkBytes} bytes) or declared artifact size`);
+            error.status = 413;
+            throw error;
+          }
+          hash.update(chunk);
+          let cursor = 0;
+          while (cursor < chunk.length) {
+            const result = await handle.write(chunk, cursor, chunk.length - cursor, offset + written + cursor);
+            cursor += result.bytesWritten;
+          }
+          written += chunk.length;
+        }
+        const actualSha256 = hash.digest('hex');
+        if (actualSha256 !== expectedSha256) {
+          const error = new Error('Artifact chunk SHA-256 mismatch');
+          error.status = 422;
+          throw error;
+        }
+        if (expectedBodySha256 && actualSha256 !== expectedBodySha256) {
+          const error = new Error('Signed artifact chunk body SHA-256 mismatch');
+          error.status = 401;
+          throw error;
+        }
+        if (!written && upload.size > upload.committedBytes) {
+          const error = new Error('Artifact chunk cannot be empty before upload completion');
+          error.status = 400;
+          throw error;
+        }
+        this.assertLiveArtifactUploadTask(taskId, input.attemptId, input.workerId);
+      } catch (error) {
+        await handle.truncate(upload.committedBytes);
+        throw error;
+      } finally {
+        await handle.close();
+      }
+      const previousCommittedBytes = upload.committedBytes;
+      upload.committedBytes += written;
+      upload.updatedAt = nowIso();
+      const task = this.state.tasks[taskId];
+      task?.events?.push({
+        at: upload.updatedAt,
+        type: 'artifact_upload_progress',
+        message: `Artifact upload ${upload.id} committed ${upload.committedBytes}/${upload.size} bytes`,
+        workerId: upload.workerId,
+        attemptId: upload.attemptId,
+        data: {
+          uploadId: upload.id,
+          path: upload.path,
+          previousCommittedBytes,
+          committedBytes: upload.committedBytes,
+          chunkBytes: written,
+          size: upload.size,
+          sha256: upload.sha256,
+        },
+      });
+      await this.save();
+      return publicArtifactUpload(upload);
+    });
+  }
+
+  async finalizeArtifactUpload(taskId, uploadId, input = {}) {
+    return this.withArtifactUploadLock(uploadId, async () => {
+      const upload = this.state.artifactUploads[uploadId];
+      if (!upload || upload.taskId !== taskId) {
+        const error = new Error(`Unknown artifact upload: ${uploadId}`);
+        error.status = 404;
+        throw error;
+      }
+      this.assertLiveArtifactUploadTask(taskId, input.attemptId, input.workerId);
+      if (upload.attemptId !== input.attemptId || upload.workerId !== input.workerId) {
+        const error = new Error(`Artifact upload ownership is stale: ${uploadId}`);
+        error.status = 409;
+        throw error;
+      }
+      if (upload.status === 'finalized') {
+        return publicArtifactUpload(upload);
+      }
+      if (upload.committedBytes !== upload.size) {
+        const error = new Error(`Artifact upload is incomplete: ${upload.committedBytes}/${upload.size}`);
+        error.status = 409;
+        error.expectedOffset = upload.committedBytes;
+        throw error;
+      }
+      const hash = crypto.createHash('sha256');
+      for await (const chunk of createReadStream(upload.tempPath)) {
+        hash.update(chunk);
+      }
+      const actualSha256 = hash.digest('hex');
+      if (actualSha256 !== upload.sha256) {
+        await fs.truncate(upload.tempPath, 0);
+        upload.committedBytes = 0;
+        upload.updatedAt = nowIso();
+        upload.lastError = 'sha256_mismatch';
+        await this.save();
+        const error = new Error('Artifact SHA-256 mismatch; upload was reset for retry');
+        error.status = 422;
+        error.expectedOffset = 0;
+        throw error;
+      }
+      const storagePath = path.join(path.dirname(upload.tempPath), `${safeName(upload.id)}.bin`);
+      await fs.rename(upload.tempPath, storagePath);
+      upload.tempPath = null;
+      upload.storagePath = storagePath;
+      upload.status = 'finalized';
+      upload.updatedAt = nowIso();
+      upload.finalizedAt = upload.updatedAt;
+      upload.lastError = null;
+      const task = this.state.tasks[taskId];
+      task?.events?.push({
+        at: upload.finalizedAt,
+        type: 'artifact_upload_finalized',
+        message: `Artifact upload ${upload.id} finalized at ${upload.size} bytes`,
+        workerId: upload.workerId,
+        attemptId: upload.attemptId,
+        data: {
+          uploadId: upload.id,
+          path: upload.path,
+          committedBytes: upload.committedBytes,
+          size: upload.size,
+          sha256: upload.sha256,
+        },
+      });
+      await this.save();
+      return publicArtifactUpload(upload);
+    });
   }
 
   listArtifacts(taskId) {
@@ -2647,15 +4654,36 @@ export class SQLiteStore extends JsonStore {
     this.migrate();
     const loaded = this.loadStateFromDatabase();
     if (loaded) {
+      const sourceVersion = Number(loaded.version ?? 0);
       this.state = normalizeStateShape(loaded);
+      this.lastMigration = {
+        fromVersion: sourceVersion,
+        toVersion: CURRENT_STATE_VERSION,
+        migrated: sourceVersion < CURRENT_STATE_VERSION,
+      };
+      if (this.lastMigration.migrated || this.lastSchemaMigration.migrated) {
+        await this.save();
+      }
       return;
     }
     const jsonFallback = JsonStore.defaultPath(this.dataDir);
-    this.state = normalizeStateShape(await readJson(jsonFallback, initialState()));
+    const fallbackState = await readJson(jsonFallback, initialState());
+    const sourceVersion = Number(fallbackState?.version ?? 0);
+    this.state = normalizeStateShape(fallbackState);
+    this.lastMigration = {
+      fromVersion: sourceVersion,
+      toVersion: CURRENT_STATE_VERSION,
+      migrated: sourceVersion < CURRENT_STATE_VERSION,
+    };
     await this.save();
   }
 
   migrate() {
+    const schemaRows = this.sqlite.exec('PRAGMA user_version');
+    const sourceSchemaVersion = Number(schemaRows[0]?.values?.[0]?.[0] || 0);
+    if (sourceSchemaVersion > CURRENT_SQLITE_SCHEMA_VERSION) {
+      throw new Error(`SQLite schema version ${sourceSchemaVersion} is newer than supported version ${CURRENT_SQLITE_SCHEMA_VERSION}`);
+    }
     this.sqlite.exec(`
       PRAGMA journal_mode = WAL;
       CREATE TABLE IF NOT EXISTS nado_state (
@@ -2673,11 +4701,19 @@ export class SQLiteStore extends JsonStore {
       );
       CREATE INDEX IF NOT EXISTS idx_nado_state_collection_position
         ON nado_state(collection, position);
+      PRAGMA user_version = ${CURRENT_SQLITE_SCHEMA_VERSION};
     `);
+    this.schemaVersion = CURRENT_SQLITE_SCHEMA_VERSION;
+    this.lastSchemaMigration = {
+      fromVersion: sourceSchemaVersion,
+      toVersion: CURRENT_SQLITE_SCHEMA_VERSION,
+      migrated: sourceSchemaVersion < CURRENT_SQLITE_SCHEMA_VERSION,
+    };
   }
 
   loadStateFromDatabase() {
     const state = initialState();
+    state.version = 0;
     const rows = this.sqlite.exec('SELECT collection, key, value FROM nado_state ORDER BY collection, position, key');
     if (!rows.length || !rows[0].values.length) {
       return null;
@@ -2700,6 +4736,7 @@ export class SQLiteStore extends JsonStore {
     this.writeQueue = this.writeQueue
       .catch(() => {})
       .then(async () => {
+        await this.writeFence?.assertOwned();
         this.writeSnapshot(snapshot);
         await this.persistDatabase();
       });
@@ -2714,15 +4751,21 @@ export class SQLiteStore extends JsonStore {
       ['workerEnrollmentTokens', snapshot.workerEnrollmentTokenOrder || Object.keys(snapshot.workerEnrollmentTokens || {})],
       ['sessions', snapshot.sessionOrder || Object.keys(snapshot.sessions || {})],
       ['batches', snapshot.batchOrder || Object.keys(snapshot.batches || {})],
+      ['artifactUploads', snapshot.artifactUploadOrder || Object.keys(snapshot.artifactUploads || {})],
+      ['inputUploads', snapshot.inputUploadOrder || Object.keys(snapshot.inputUploads || {})],
       ['tasks', snapshot.taskOrder || Object.keys(snapshot.tasks || {})],
     ];
     const metaKeys = [
+      'version',
       'workerTokenOrder',
       'workerEnrollmentTokenOrder',
       'sessionOrder',
       'batchOrder',
+      'artifactUploadOrder',
+      'inputUploadOrder',
       'taskOrder',
       'commandOrder',
+      'auditEvents',
     ];
     this.sqlite.exec('BEGIN IMMEDIATE TRANSACTION');
     try {
@@ -2750,7 +4793,7 @@ export class SQLiteStore extends JsonStore {
       `);
       try {
         for (const key of metaKeys) {
-          insertMeta.run([key, JSON.stringify(snapshot[key] || [])]);
+          insertMeta.run([key, JSON.stringify(snapshot[key] ?? [])]);
         }
       } finally {
         insertMeta.free();
@@ -2763,18 +4806,22 @@ export class SQLiteStore extends JsonStore {
   }
 
   async persistDatabase() {
+    await this.writeFence?.assertOwned();
     const bytes = Buffer.from(this.sqlite.export());
     await ensureDir(path.dirname(this.file));
     const tmp = `${this.file}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     await fs.writeFile(tmp, bytes);
     try {
+      await this.writeFence?.assertOwned();
       await fs.rename(tmp, this.file);
     } catch (error) {
       if (process.platform === 'win32' && (error.code === 'EPERM' || error.code === 'EEXIST')) {
+        await this.writeFence?.assertOwned();
         await fs.rm(this.file, { force: true });
         await fs.rename(tmp, this.file);
         return;
       }
+      await fs.rm(tmp, { force: true }).catch(() => {});
       throw error;
     }
   }

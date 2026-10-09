@@ -4,14 +4,19 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { startControlServer } from './control-server.js';
 import { NadoClient } from './http-client.js';
-import { startWorker } from './worker-client.js';
+import { reconnectDelay, startWorker } from './worker-client.js';
 import { formatBatchReport } from './batch-report.js';
 import { buildAgentContext, installAgentContext, writeAgentContext } from './context.js';
 import { runDoctor } from './doctor.js';
 import { collectLocalInputFiles } from './input-files.js';
 import { buildWorkerInvite } from './invite.js';
 import { buildWorkerBootstrapBundle, buildWorkerBundle } from './worker-bundle.js';
-import { ensureEnrolledWorker } from './worker-enrollment.js';
+import {
+  confirmPendingWorkerTokenRotation,
+  ensureEnrolledWorker,
+  readWorkerIdentity,
+  rotateEnrolledWorkerToken,
+} from './worker-enrollment.js';
 import { buildMcpClientConfig, formatMcpCommand } from './mcp-config.js';
 import { listAgentPresets, resolveAgentCommand } from './agent-presets.js';
 import { buildBatchPlan } from './batch-plan.js';
@@ -20,29 +25,78 @@ import { buildDemoRouteChecks, demoRouteChecksOk } from './demo-health.js';
 import { routingActionHint } from './routing-diagnostics.js';
 import { controlUrlFromHostPort, parseCsvValues, requireValue, safeName, sleep } from './utils.js';
 import { workerReadinessDiagnostics, workerResourceDiagnostics } from './worker-diagnostics.js';
+import { inspectLocalWorker } from './worker-inspect.js';
+import { collectInventory } from './inventory.js';
+import { createControlBackup, restoreControlBackup, verifyControlBackup } from './store-backup.js';
+import {
+  acceptanceEvidenceTemplate,
+  buildCrossSiteAcceptanceReport,
+  initializeAcceptanceEvidence,
+  recordAcceptanceEvidence,
+} from './cross-site-acceptance.js';
+import { buildAcceptanceRunbook } from './acceptance-runbook.js';
+import {
+  runBackupRestoreExercise,
+  runAgentCollaborationExercise,
+  runLargeArtifactResumeExercise,
+  runLargeInputResumeExercise,
+  runLongDisconnectRecoveryExercise,
+  runRemoteCancellationExercise,
+  runShortDisconnectExercise,
+  runVmRestartRecoveryExercise,
+  runWorkerRestartRecoveryExercise,
+} from './acceptance-exercises.js';
+import {
+  inspectDockerComposeBindings,
+  inspectDockerComposeControlSecurity,
+  runDeploymentCheck,
+} from './deployment-check.js';
+import { probeControlClock } from './clock-skew.js';
+import { runtimeBuildCompatibility } from './runtime-build.js';
 
 function usage() {
   return `Nado Agent
 
 Usage:
-  nado quickstart [--host 127.0.0.1] [--port 8765] [--public-control-url URL] [--trust-proxy] [--data-dir .nado/quickstart] [--store json|sqlite] [--token TOKEN] [--worker local-worker] [--capability code] [--agent codex|claude|node-copy] [--agent-command CMD] [--mcp-name nado] [--no-dashboard-auto-token] [--once]
-  nado control start [--host 127.0.0.1] [--port 8765] [--public-control-url URL] [--trust-proxy] [--data-dir .nado] [--store json|sqlite] [--token TOKEN] [--dashboard-auto-token]
-  nado worker start --control URL --id ID [--capability code] [--agent codex|claude|node-copy] [--agent-command CMD] [--max-concurrency 1] [--cleanup-workspaces]
-  nado worker bootstrap-start --control URL --enrollment-token TOKEN [--id optional-id] [--capability code] [--agent codex|claude|node-copy] [--max-concurrency 1] [--cleanup-workspaces]
+  nado quickstart [--host 127.0.0.1] [--port 8765] [--public-control-url URL] [--trust-proxy] [--trust-proxy-secret SECRET] [--task-lease-ms 60000] [--auto-recover-offline-ms 120000] [--data-dir .nado/quickstart] [--store json|sqlite] [--token TOKEN] [--generate-token-file FILE] [--worker local-worker] [--capability code] [--agent codex|claude|node-copy] [--agent-command CMD] [--completion-retries 16] [--completion-retry-base-ms 250] [--completion-retry-max-ms 5000] [--network-probe-bytes 65536] [--network-probe-interval-ms 300000] [--mcp-name nado] [--no-dashboard-auto-token] [--once]
+  nado control start [--host 127.0.0.1] [--port 8765] [--public-control-url URL] [--trust-proxy] [--trust-proxy-secret SECRET] [--task-lease-ms 60000] [--auto-recover-offline-ms 120000] [--control-data-lease-timeout-ms 60000] [--audit-ndjson-file /var/log/nado/audit.ndjson] [--audit-ndjson-max-pending 1024] [--data-dir .nado] [--store json|sqlite] [--token TOKEN] [--generate-token-file FILE] [--dashboard-auto-token]
+  nado store backup --data-dir .nado --out ./nado-backup [--store json|sqlite] --offline-confirmed [--json]
+  nado store verify --from ./nado-backup [--json]
+  nado store restore --from ./nado-backup --data-dir ./restored-control --offline-confirmed [--json]
+  nado worker start --control URL --id ID [--capability code] [--agent codex|claude|node-copy] [--agent-command CMD] [--max-concurrency 1] [--long-poll-ms 20000] [--reconnect-base-ms 1000] [--reconnect-max-ms 30000] [--completion-retries 16] [--completion-retry-base-ms 250] [--completion-retry-max-ms 5000] [--network-probe-bytes 65536] [--network-probe-interval-ms 300000] [--cleanup-workspaces]
+  nado worker bootstrap-start --control URL --enrollment-token TOKEN [--id optional-id] [--capability code] [--agent codex|claude|node-copy] [--strict-local-readiness] [--max-concurrency 1] [--token-rotation-interval-ms 0] [--completion-retries 16] [--completion-retry-base-ms 250] [--completion-retry-max-ms 5000] [--network-probe-bytes 65536] [--network-probe-interval-ms 300000] [--cleanup-workspaces]
+  nado worker inspect [--data-dir .nado] [--capability code] [--agent codex|claude] [--require-gpu] [--require-agent] [--require-identity] [--require-capability code] [--tool amd-smi] [--platform linux|win32|darwin] [--arch x64|arm64] [--cpu 8] [--memory 32GiB] [--gpu-count 1] [--vram 16GiB] [--gpu-model MI300] [--out ./worker-inspect.json] [--json]
   nado worker preflight --control URL --id ID [--data-dir .nado]
   nado worker logs --control URL --id ID [--tail 50] [--watch]
   nado worker invite --control URL --id ID [--bundle-control-url URL] [--public-control-url URL] [--capability code] [--agent codex|claude|node-copy] [--issue-token] [--format bash|powershell] [--cleanup-workspaces]
-  nado worker bundle --control URL --id ID [--bundle-control-url URL] [--public-control-url URL] [--capability code] [--agent codex|claude|node-copy] [--issue-token] [--out ./nado-worker.zip] [--cleanup-workspaces]
-  nado worker bootstrap-bundle --control URL [--bundle-control-url URL] [--public-control-url URL] [--out ./nado-worker-bootstrap.zip] [--capability code] [--agent codex|claude|node-copy] [--max-uses N] [--cleanup-workspaces]
+  nado worker bundle --control URL --id ID [--bundle-control-url URL] [--public-control-url URL] [--data-dir /stable/worker-data] [--capability code] [--agent codex|claude|node-copy] [--issue-token] [--out ./nado-worker.zip] [--cleanup-workspaces]
+  nado worker bootstrap-bundle --control URL [--bundle-control-url URL] [--public-control-url URL] [--data-dir /stable/worker-data] [--out ./nado-worker-bootstrap.zip] [--capability code] [--agent codex|claude|node-copy] [--strict-local-readiness] [--max-uses N] [--cleanup-workspaces]
   nado agents
   nado worker token create --control URL --id ID [--label LABEL] [--expires-at ISO]
+  nado worker token rotate --control URL [--data-dir .nado] [--ttl-ms 600000] [--verify] [--evidence ./acceptance-evidence.json]
   nado worker tokens --control URL [--worker ID]
   nado worker token revoke TOKEN_ID --control URL
   nado worker enrollments --control URL
   nado worker enrollments prune [--dry-run] [--json] --control URL
   nado worker enrollment revoke TOKEN_ID --control URL
-  nado worker manage --control URL --id ID --action pause|resume|drain|shutdown|cancel_current|forget
+  nado worker manage --control URL --id ID --action pause|resume|drain|shutdown|cancel_current|rotate_token|forget [--wait] [--evidence ./acceptance-evidence.json]
   nado status --control URL
+  nado audit --control URL [--tail 100] [--actor-type admin|worker|worker_enrollment|anonymous] [--outcome success|denied|error] [--status-code 403] [--json] [--out ./audit.ndjson]
+  nado acceptance template --out ./acceptance-evidence.json
+  nado acceptance evidence init --file ./acceptance-evidence.json
+  nado acceptance evidence record --file ./acceptance-evidence.json --scenario SCENARIO --status passed|failed|pending [--note TEXT] [--reference REF]
+  nado acceptance runbook --control URL --worker ID [--deployment-mode public_https|tailscale|wireguard] [--overlay-interface NAME] [--require-gpu] [--no-require-agent] [--source-data-dir PATH] [--backup-dir PATH] [--restored-data-dir PATH] [--out ./acceptance-runbook.sh] [--json]
+  nado acceptance exercise remote-cancellation --control URL --worker ID --evidence ./acceptance-evidence.json [--timeout 60000] [--json]
+  nado acceptance exercise agent-collaboration --control URL --worker ID --evidence ./acceptance-evidence.json [--timeout 180000] [--json]
+  nado acceptance exercise short-disconnect --control URL --worker ID --evidence ./acceptance-evidence.json [--min-disconnect-ms 5000] [--task-duration-ms 90000] [--timeout 180000] [--json]
+  nado acceptance exercise long-disconnect-recovery --control URL --worker ID --evidence ./acceptance-evidence.json [--first-attempt-ms auto] [--timeout 300000] [--json]
+  nado acceptance exercise vm-restart-recovery --control URL --worker ID --evidence ./acceptance-evidence.json [--task-duration-ms 90000] [--timeout 300000] [--json]
+  nado acceptance exercise worker-restart-recovery --control URL --worker ID --evidence ./acceptance-evidence.json [--timeout 300000] [--json]
+  nado acceptance exercise large-artifact-resume --control URL --worker ID --evidence ./acceptance-evidence.json [--artifact-bytes 67108864] [--min-stall-ms 5000] [--timeout 300000] [--json]
+  nado acceptance exercise large-input-resume --control URL --worker ID --evidence ./acceptance-evidence.json [--input-bytes 67108864] [--min-stall-ms 5000] [--timeout 300000] [--json]
+  nado acceptance exercise backup-restore --control URL --worker ID --source-data-dir PATH --backup-dir PATH --restored-data-dir NEW_PATH --evidence ./acceptance-evidence.json [--timeout 600000] [--json]
+  nado acceptance --control URL --worker ID [--require-gpu] [--no-require-agent] [--run-verify] [--deployment-evidence ./deployment-check.json] [--evidence ./acceptance-evidence.json] [--out ./acceptance-report.json] [--require-complete] [--json]
+  nado deployment check --control URL [--backend http://127.0.0.1:8765] [--require-https] [--require-proxy-auth] [--require-container-hardening] [--overlay tailscale|wireguard] [--overlay-interface NAME] [--compose-file docker-compose.azure.yml] [--timeout 15000] [--out ./deployment-check.json] [--json]
   nado network --control URL [--json]
   nado demo health --control URL [--timeout 60000] [--skip-verify] [--no-prune] [--json]
   nado demo reset --control URL [--keep 0] [--dry-run] [--yes] [--no-system] [--keep-empty-sessions] [--json]
@@ -50,12 +104,12 @@ Usage:
   nado verify --control URL [--worker ID] [--all-workers] [--capability code] [--tool node] [--required-label zone=lab] [--timeout 30000] [--skip-doctor] [--json]
   nado doctor --control URL [--self-test] [--agent-self-test] [--all-workers] [--worker ID] [--capability code] [--tool node] [--required-label zone=lab] [--timeout 15000]
   nado workers --control URL
-  nado session create --control URL --title TITLE [--worker ID] [--capability code] [--tool codex] [--required-label zone=lab]
+  nado session create --control URL --title TITLE [--worker ID] [--capability code] [--tool codex] [--required-label zone=lab] [--platform linux|win32|darwin] [--arch x64|arm64] [--cpu 4] [--memory 16GiB] [--gpu-count 1] [--vram 12GiB] [--gpu-model RTX]
   nado sessions --control URL
   nado session SESSION_ID --control URL
   nado session close SESSION_ID --control URL
   nado session download SESSION_ID --out ./downloads --control URL
-  nado submit --control URL (--command CMD | --prompt PROMPT) [--worker ID] [--capability gpu] [--tool codex] [--required-label zone=lab] [--env KEY=value] [--sandbox|--sandbox-profile isolated] [--artifact dist/**] [--exclude-artifact tmp/**] [--dependency-artifacts] [--slots 2] [--priority 10] [--session SESSION_ID] [--file ./input.md] [--dir ./project] [--cleanup-workspace] [--keep-workspace] [--require-routable] [--wait] [--watch] [--download --out ./downloads] [--wait-timeout 60000] [--type shell|agent]
+  nado submit --control URL (--command CMD | --prompt PROMPT) [--worker ID] [--capability gpu] [--tool codex] [--required-label zone=lab] [--platform linux|win32|darwin] [--arch x64|arm64] [--cpu 4] [--memory 16GiB] [--gpu-count 1] [--vram 12GiB] [--gpu-model RTX] [--env KEY=value] [--sandbox|--sandbox-profile isolated] [--artifact dist/**] [--exclude-artifact tmp/**] [--dependency-artifacts] [--slots 2] [--priority 10] [--max-attempts 3] [--retry-on timeout,worker_error] [--retry-exit-code 75,124] [--retry-backoff-ms 1000] [--max-retry-backoff-ms 60000] [--idempotency-key KEY] [--session SESSION_ID] [--file ./input.md] [--dir ./project] [--cleanup-workspace] [--keep-workspace] [--require-routable] [--wait] [--watch] [--download --out ./downloads] [--wait-timeout 60000] [--type shell|agent]
   nado batch plan --title TITLE (--task "key: task" | --tasks-file ./tasks.txt) [--type agent|shell] [--command-template CMD] [--worker ID] [--capability code] [--tool node] [--required-label zone=lab] [--out ./batch.json]
   nado planner plan --control URL (--prompt PROMPT | --prompt-file ./brief.md) [--mode auto|parallel|pipeline|map_reduce|review] [--subtask "key: focus"] [--shards 4] [--out ./batch.json] [--json]
   nado planner run --control URL (--prompt PROMPT | --prompt-file ./brief.md) [--mode auto|parallel|pipeline|map_reduce|review] [--subtask "key: focus"] [--require-routable] [--wait] [--report] [--download --out ./downloads]
@@ -90,7 +144,36 @@ Environment:
   NADO_CONTROL     default control URL for CLI/worker commands
   NADO_STORE       control storage backend: json (default) or sqlite
   NADO_PUBLIC_CONTROL_URL  browser/remote-worker reachable public Control URL advertised by control APIs
-  NADO_TRUST_PROXY         trust X-Forwarded-Host and X-Forwarded-Proto when control is behind a reverse proxy
+  NADO_TRUST_PROXY         enable authenticated trusted-proxy mode
+  NADO_TRUST_PROXY_SECRET  shared secret required in X-Nado-Proxy-Secret before forwarded headers are trusted
+  NADO_AUTO_RECOVER_OFFLINE_MS  opt-in grace period before offline tasks are requeued; sessions stay pinned to their workspace-owning Worker
+  NADO_TASK_LEASE_MS             task execution lease duration renewed by worker heartbeats (default 60000)
+  NADO_WORKER_RECONNECT_BASE_MS  initial worker reconnect delay after a control-plane error
+  NADO_WORKER_RECONNECT_MAX_MS   maximum worker reconnect delay after repeated errors
+  NADO_WORKER_COMPLETION_RETRIES maximum completion delivery attempts before releasing the worker slot
+  NADO_WORKER_COMPLETION_RETRY_BASE_MS initial completion delivery retry delay
+  NADO_WORKER_COMPLETION_RETRY_MAX_MS  maximum completion delivery retry delay
+  NADO_TASK_EVENT_RETRIES        maximum live task-event delivery attempts
+  NADO_TASK_EVENT_RETRY_BASE_MS  initial live task-event retry delay
+  NADO_TASK_EVENT_RETRY_MAX_MS   maximum live task-event retry delay
+  NADO_TASK_EVENT_MAX_PENDING    bounded ordered live task-event queue (default 256)
+  NADO_WORKER_EVENT_RETRIES      maximum critical Worker-event delivery attempts
+  NADO_WORKER_EVENT_RETRY_BASE_MS initial critical Worker-event retry delay
+  NADO_WORKER_EVENT_RETRY_MAX_MS maximum critical Worker-event retry delay
+  NADO_WORKER_LONG_POLL_MS       idle worker claim long-poll timeout; set 0 for compatibility polling
+  NADO_WORKER_TOKEN_ROTATION_INTERVAL_MS  self-service Worker credential rotation interval; 0 disables automatic rotation
+  NADO_NETWORK_PROBE_BYTES       bounded upload/download sample size (4096-1048576)
+  NADO_NETWORK_PROBE_INTERVAL_MS sample interval; set 0 to disable, otherwise minimum 60000
+  NADO_ARTIFACT_INLINE_MAX_BYTES maximum single artifact embedded in result JSON
+  NADO_ARTIFACT_INLINE_TOTAL_BYTES maximum total artifacts embedded in result JSON
+  NADO_ARTIFACT_CHUNK_BYTES      resumable artifact upload chunk size (default 4 MiB)
+  NADO_ARTIFACT_MAX_FILE_BYTES   hard collection limit for one artifact
+  NADO_ARTIFACT_MAX_TOTAL_BYTES  hard collection limit across one task
+  NADO_INPUT_INLINE_MAX_BYTES    maximum single input embedded in task JSON
+  NADO_INPUT_INLINE_TOTAL_BYTES  maximum total inputs embedded in task JSON
+  NADO_INPUT_CHUNK_BYTES         resumable control-side input upload chunk size
+  NADO_INPUT_MAX_FILE_BYTES      hard local collection limit for one input
+  NADO_INPUT_MAX_TOTAL_BYTES     hard local collection limit across one task
   NADO_DOCKER_HOST_IP      Docker demo host port bind address, for example :: for IPv6
 `;
 }
@@ -172,6 +255,28 @@ function parseSlots(value) {
   return Number(value);
 }
 
+function retryPolicyFromArgs(args) {
+  const failureKinds = valueList(args['retry-on'] || args.retryOn);
+  const exitCodes = valueList(args['retry-exit-code'] || args['retry-exit-codes'] || args.retryExitCodes)
+    .map((value) => Number(value));
+  return failureKinds.length || exitCodes.length ? { failureKinds, exitCodes } : undefined;
+}
+
+function resourceRequirementsFromArgs(args) {
+  const requiredResources = {
+    platform: args.platform ?? args.os,
+    arch: args.arch ?? args.architecture,
+    cpuCores: args.cpu ?? args['cpu-cores'],
+    memory: args.memory ?? args.ram,
+    gpuCount: args['gpu-count'] ?? args.gpus,
+    gpuMemory: args.vram ?? args['gpu-memory'],
+    gpuModel: args['gpu-model'],
+  };
+  return Object.values(requiredResources).some((value) => value !== undefined && value !== '')
+    ? requiredResources
+    : undefined;
+}
+
 function sandboxProfileFromArgs(args) {
   if (args.sandbox) {
     return 'isolated';
@@ -184,6 +289,20 @@ function agentOptionsFromArgs(args) {
     agentPreset: args.agent || args['agent-preset'] || args.agentPreset,
     agentCommand: args['agent-command'] || process.env.NADO_AGENT_COMMAND || null,
   });
+}
+
+function workerCompletionOptionsFromArgs(args) {
+  return {
+    completionRetries: Number(
+      args['completion-retries'] ?? process.env.NADO_WORKER_COMPLETION_RETRIES ?? 0,
+    ) || undefined,
+    completionRetryBaseMs: Number(
+      args['completion-retry-base-ms'] ?? process.env.NADO_WORKER_COMPLETION_RETRY_BASE_MS ?? 0,
+    ) || undefined,
+    completionRetryMaxMs: Number(
+      args['completion-retry-max-ms'] ?? process.env.NADO_WORKER_COMPLETION_RETRY_MAX_MS ?? 0,
+    ) || undefined,
+  };
 }
 
 function artifactPolicyFromArgs(args) {
@@ -239,6 +358,28 @@ function formatLabels(labels = {}) {
   return entries.length ? entries.map(([key, value]) => `${key}=${value}`).join(',') : '-';
 }
 
+function formatMetricBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return '-';
+  }
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let amount = bytes;
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit += 1;
+  }
+  return `${amount >= 10 || unit === 0 ? amount.toFixed(0) : amount.toFixed(1)}${units[unit]}`;
+}
+
+function formatBandwidth(value) {
+  const bytesPerSecond = Number(value);
+  return Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0
+    ? `${Math.round(((bytesPerSecond * 8) / 1_000_000) * 10) / 10}Mbps`
+    : '-';
+}
+
 function printSchedulerSummary(scheduler) {
   if (!scheduler) {
     return;
@@ -247,6 +388,7 @@ function printSchedulerSummary(scheduler) {
   console.log(`schedulerReason=${scheduler.reason || '-'}`);
   console.log(`schedulerInferredCapabilities=${scheduler.inferredCapabilities?.join(',') || '-'}`);
   console.log(`schedulerEffectiveCapabilities=${scheduler.effectiveRequiredCapabilities?.join(',') || '-'}`);
+  console.log(`schedulerRequiredResources=${JSON.stringify(scheduler.requiredResources || {})}`);
   for (const reason of scheduler.inferenceReasons || []) {
     console.log(`schedulerInference=${reason.capability || '-'} reason=${reason.reason || '-'} evidence=${reason.evidence || '-'}`);
   }
@@ -286,6 +428,86 @@ async function buildInputFiles(values) {
   });
 }
 
+function submittedInputFile(file) {
+  const { localPath, ...submitted } = file;
+  return submitted;
+}
+
+async function uploadLocalTaskInput(client, task, localFile, options = {}) {
+  const descriptor = (task.inputFiles || []).find((file) => (
+    file.inputUploadId
+    && file.path === localFile.path
+    && file.size === localFile.size
+    && file.sha256 === localFile.sha256
+  ));
+  if (!descriptor) {
+    throw new Error(`Task did not create an upload slot for input: ${localFile.path}`);
+  }
+  const chunkBytes = Math.max(64 * 1024, Math.min(
+    16 * 1024 * 1024,
+    Number(options.chunkBytes || process.env.NADO_INPUT_CHUNK_BYTES || 4 * 1024 * 1024),
+  ));
+  const maxRetries = Math.max(1, Number(options.maxRetries || 8));
+  const handle = await fs.open(localFile.localPath, 'r');
+  let status = await client.getTaskInputUpload(task.id, descriptor.inputUploadId);
+  let offset = Number(status.upload.committedBytes || 0);
+  try {
+    while (offset < localFile.size) {
+      const length = Math.min(chunkBytes, localFile.size - offset);
+      const bytes = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(bytes, 0, length, offset);
+      if (bytesRead !== length) {
+        throw new Error(`Input file changed or ended during upload: ${localFile.path}`);
+      }
+      let delivered = false;
+      let lastError = null;
+      for (let attempt = 1; attempt <= maxRetries && !delivered; attempt += 1) {
+        try {
+          const response = await client.uploadTaskInputChunk(task.id, descriptor.inputUploadId, offset, bytes);
+          offset = Number(response.upload.committedBytes);
+          delivered = true;
+        } catch (error) {
+          lastError = error;
+          if ([400, 401, 403, 404, 413, 422].includes(error.status)) {
+            throw error;
+          }
+          try {
+            status = await client.getTaskInputUpload(task.id, descriptor.inputUploadId);
+            const committed = Number(status.upload.committedBytes || 0);
+            if (committed !== offset) {
+              offset = committed;
+              delivered = true;
+              break;
+            }
+          } catch (statusError) {
+            if ([400, 401, 403, 404, 413, 422].includes(statusError.status)) {
+              throw statusError;
+            }
+          }
+          if (attempt < maxRetries) {
+            await sleep(reconnectDelay(attempt, { baseMs: 250, maxMs: 5_000 }));
+          }
+        }
+      }
+      if (!delivered) {
+        throw lastError || new Error(`Input chunk upload failed: ${localFile.path}`);
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+  await client.finalizeTaskInputUpload(task.id, descriptor.inputUploadId);
+}
+
+async function uploadLocalTaskInputs(client, task, localFiles = []) {
+  for (const file of localFiles.filter((item) => item.localPath)) {
+    await uploadLocalTaskInput(client, task, file);
+  }
+  return localFiles.some((file) => file.localPath)
+    ? (await client.getTask(task.id)).task
+    : task;
+}
+
 function tokenFrom(args, { allowGenerate = false } = {}) {
   if (args.token) {
     return args.token;
@@ -297,6 +519,58 @@ function tokenFrom(args, { allowGenerate = false } = {}) {
     return crypto.randomBytes(16).toString('hex');
   }
   throw new Error('Missing token. Set NADO_TOKEN or pass --token.');
+}
+
+function loopbackListenHost(host) {
+  const value = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return value === 'localhost' || value === '::1' || value.startsWith('127.');
+}
+
+function pathInside(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function remoteFacingControl(options) {
+  return !loopbackListenHost(options.host)
+    || Boolean(options.publicControlUrl)
+    || Boolean(options.trustProxy);
+}
+
+async function controlStartToken(args, options) {
+  const supplied = args.token || process.env.NADO_TOKEN || '';
+  const outputArg = args['generate-token-file'] || args.generateTokenFile || '';
+  if (supplied && outputArg) {
+    throw new Error('--generate-token-file cannot be combined with --token or NADO_TOKEN');
+  }
+  if (supplied) {
+    return {
+      token: supplied,
+      source: args.token ? 'argument' : 'environment',
+      outputFile: null,
+    };
+  }
+
+  const remotelyExposed = remoteFacingControl(options);
+  if (remotelyExposed && !outputArg) {
+    throw new Error(
+      'Remote-facing control start requires NADO_TOKEN/--token or --generate-token-file <private-file>; refusing to print a generated administrator token into service logs',
+    );
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  if (!outputArg) {
+    return { token, source: 'generated_terminal', outputFile: null };
+  }
+
+  const outputFile = path.resolve(outputArg);
+  if (pathInside(options.dataDir, outputFile)) {
+    throw new Error('--generate-token-file must be outside the Control data directory so verified backups cannot capture the administrator credential');
+  }
+  await fs.mkdir(path.dirname(outputFile), { recursive: true, mode: 0o700 });
+  await fs.writeFile(outputFile, `${token}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  await fs.chmod(outputFile, 0o600);
+  return { token, source: 'generated_file', outputFile };
 }
 
 function controlUrlFrom(args) {
@@ -400,11 +674,18 @@ function defaultEnrollmentExpiresAt(value) {
 }
 
 async function commandControlStart(args) {
-  const token = tokenFrom(args, { allowGenerate: true });
   const dataDir = path.resolve(args['data-dir'] || '.nado');
   const host = args.host || '127.0.0.1';
   const port = Number(args.port || 8765);
   const publicControlUrl = args['public-control-url'] || args.publicControlUrl || process.env.NADO_PUBLIC_CONTROL_URL || '';
+  const trustProxy = Boolean(args['trust-proxy'] || args.trustProxy);
+  const tokenResult = await controlStartToken(args, {
+    dataDir,
+    host,
+    publicControlUrl,
+    trustProxy,
+  });
+  const { token } = tokenResult;
 
   const running = await startControlServer({
     host,
@@ -414,14 +695,101 @@ async function commandControlStart(args) {
     storeBackend: args.store || process.env.NADO_STORE,
     dashboardAutoToken: Boolean(args['dashboard-auto-token']),
     publicControlUrl,
-    trustProxy: Boolean(args['trust-proxy'] || args.trustProxy),
+    trustProxy,
+    trustProxySecret: args['trust-proxy-secret'] || args.trustProxySecret || process.env.NADO_TRUST_PROXY_SECRET,
+    autoRecoverOfflineMs: args['auto-recover-offline-ms'] || process.env.NADO_AUTO_RECOVER_OFFLINE_MS,
+    taskLeaseMs: args['task-lease-ms'] || process.env.NADO_TASK_LEASE_MS,
+    controlDataLeaseTimeoutMs: args['control-data-lease-timeout-ms']
+      || process.env.NADO_CONTROL_DATA_LEASE_TIMEOUT_MS,
+    controlDataLeaseHeartbeatMs: args['control-data-lease-heartbeat-ms']
+      || process.env.NADO_CONTROL_DATA_LEASE_HEARTBEAT_MS,
+    auditNdjsonFile: args['audit-ndjson-file'] || process.env.NADO_AUDIT_NDJSON_FILE,
+    auditNdjsonMaxPending: args['audit-ndjson-max-pending'] || process.env.NADO_AUDIT_NDJSON_MAX_PENDING,
   });
   console.log(`Nado control server listening on ${controlUrlFromHostPort(host, running.port)}`);
   if (publicControlUrl) {
     console.log(`Public control URL: ${publicControlUrl}`);
   }
-  console.log(`NADO_TOKEN=${token}`);
+  if (tokenResult.source === 'generated_terminal') {
+    console.log(`Generated local-only NADO_TOKEN=${token}`);
+    console.log('Warning: save this token now; it is shown only for an implicit loopback development start.');
+  } else if (tokenResult.source === 'generated_file') {
+    console.log(`Generated administrator token written to private file: ${tokenResult.outputFile}`);
+  } else {
+    console.log(`Administrator token: configured via ${tokenResult.source} (redacted)`);
+  }
   console.log(`Data dir: ${dataDir}`);
+  let closing = false;
+  const close = (signal) => {
+    if (closing) {
+      return;
+    }
+    closing = true;
+    console.log(`Stopping Nado control server after ${signal}`);
+    running.server.close((error) => {
+      if (error) {
+        console.error(error.message || error);
+        process.exitCode = 1;
+      }
+    });
+  };
+  process.once('SIGINT', () => close('SIGINT'));
+  process.once('SIGTERM', () => close('SIGTERM'));
+}
+
+async function commandStoreBackup(args) {
+  const result = await createControlBackup({
+    dataDir: path.resolve(args['data-dir'] || '.nado'),
+    output: args.out ? path.resolve(args.out) : undefined,
+    backend: args.store || process.env.NADO_STORE,
+    offlineConfirmed: Boolean(args['offline-confirmed']),
+  });
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(`backup=${result.output}`);
+  console.log(`backend=${result.manifest.backend}`);
+  console.log(`stateVersion=${result.manifest.stateVersion}`);
+  console.log(`files=${result.manifest.fileCount}`);
+  console.log(`bytes=${result.manifest.totalBytes}`);
+  console.log('verification=ok');
+}
+
+async function commandStoreVerify(args) {
+  const backupDir = path.resolve(requireValue(args.from, 'store verify requires --from <backup-dir>'));
+  const result = await verifyControlBackup({ backupDir });
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(`backup=${result.backupDir}`);
+  console.log(`backend=${result.manifest.backend}`);
+  console.log(`stateVersion=${result.manifest.stateVersion}`);
+  console.log(`files=${result.manifest.fileCount}`);
+  console.log(`bytes=${result.manifest.totalBytes}`);
+  console.log('verification=ok');
+}
+
+async function commandStoreRestore(args) {
+  const backupDir = path.resolve(requireValue(args.from, 'store restore requires --from <backup-dir>'));
+  const dataDir = path.resolve(requireValue(args['data-dir'], 'store restore requires a new --data-dir path'));
+  const result = await restoreControlBackup({
+    backupDir,
+    dataDir,
+    offlineConfirmed: Boolean(args['offline-confirmed']),
+  });
+  if (args.json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  console.log(`restored=${result.dataDir}`);
+  console.log(`backend=${result.backend}`);
+  console.log(`stateVersion=${result.stateVersion}`);
+  console.log(`migrated=${result.migrated}`);
+  console.log(`restoreReceipt=${result.receipt.id}`);
+  console.log(`backupManifestSha256=${result.receipt.manifestSha256}`);
+  console.log('verification=ok');
 }
 
 async function closeServer(server) {
@@ -438,17 +806,26 @@ async function closeServer(server) {
 
 async function writeMcpConfigFile(out, config) {
   const target = path.resolve(out);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+  await fs.writeFile(target, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  await fs.chmod(target, 0o600);
   return target;
 }
 
 async function commandQuickstart(args) {
-  const token = tokenFrom(args, { allowGenerate: true });
   const root = path.resolve(args['data-dir'] || path.join('.nado', 'quickstart'));
   const host = args.host || '127.0.0.1';
   const port = Number(args.port || 8765);
   const publicControlUrl = args['public-control-url'] || args.publicControlUrl || process.env.NADO_PUBLIC_CONTROL_URL || '';
+  const trustProxy = Boolean(args['trust-proxy'] || args.trustProxy);
+  const tokenResult = await controlStartToken(args, {
+    dataDir: path.join(root, 'control'),
+    host,
+    publicControlUrl,
+    trustProxy,
+  });
+  const { token } = tokenResult;
+  const remotelyExposed = remoteFacingControl({ host, publicControlUrl, trustProxy });
   const workerId = args.worker || args.id || 'local-worker';
   const capabilities = valueList(args.capability || args.capabilities);
   const agentOptions = agentOptionsFromArgs(args);
@@ -464,9 +841,12 @@ async function commandQuickstart(args) {
     token,
     dataDir: path.join(root, 'control'),
     storeBackend: args.store || process.env.NADO_STORE,
-    dashboardAutoToken: args['no-dashboard-auto-token'] ? false : true,
+    dashboardAutoToken: remotelyExposed ? false : !args['no-dashboard-auto-token'],
     publicControlUrl,
-    trustProxy: Boolean(args['trust-proxy'] || args.trustProxy),
+    trustProxy,
+    trustProxySecret: args['trust-proxy-secret'] || args.trustProxySecret || process.env.NADO_TRUST_PROXY_SECRET,
+    autoRecoverOfflineMs: args['auto-recover-offline-ms'] || process.env.NADO_AUTO_RECOVER_OFFLINE_MS,
+    taskLeaseMs: args['task-lease-ms'] || process.env.NADO_TASK_LEASE_MS,
   });
   const controlUrl = controlUrlFromHostPort(host, running.port);
   const advertisedControlUrl = publicControlUrl || controlUrl;
@@ -484,6 +864,12 @@ async function commandQuickstart(args) {
     maxConcurrency: Number(args['max-concurrency'] || args.concurrency || 1),
     cleanupWorkspaces: Boolean(args['cleanup-workspaces']),
     pollMs: Number(args['poll-ms'] || 250),
+    longPollMs: Number(args['long-poll-ms'] ?? process.env.NADO_WORKER_LONG_POLL_MS ?? 20_000),
+    reconnectBaseMs: Number(args['reconnect-base-ms'] || process.env.NADO_WORKER_RECONNECT_BASE_MS || 0) || undefined,
+    reconnectMaxMs: Number(args['reconnect-max-ms'] || process.env.NADO_WORKER_RECONNECT_MAX_MS || 0) || undefined,
+    ...workerCompletionOptionsFromArgs(args),
+    networkProbeBytes: args['network-probe-bytes'] ?? process.env.NADO_NETWORK_PROBE_BYTES,
+    networkProbeIntervalMs: args['network-probe-interval-ms'] ?? process.env.NADO_NETWORK_PROBE_INTERVAL_MS,
     onLog: (line) => {
       if (args.verbose) {
         console.log(`[quickstart:${workerId}] ${line}`);
@@ -526,7 +912,13 @@ async function commandQuickstart(args) {
       console.log(`publicControl=${publicControlUrl}`);
     }
     console.log(`dashboard=${advertisedControlUrl}/dashboard`);
-    console.log(`token=${token}`);
+    if (tokenResult.source === 'generated_terminal') {
+      console.log(`generatedLocalToken=${token}`);
+    } else if (tokenResult.source === 'generated_file') {
+      console.log(`generatedTokenFile=${tokenResult.outputFile}`);
+    } else {
+      console.log(`token=configured:${tokenResult.source}:redacted`);
+    }
     console.log(`dataDir=${root}`);
     console.log(`worker=${workerId}`);
     console.log(`agentContext=${contextOut}`);
@@ -548,8 +940,8 @@ async function commandQuickstart(args) {
     }
 
     console.log('doctor=ok');
-    console.log(`submitExample=NADO_TOKEN=${token} node ./src/cli.js submit --control ${advertisedControlUrl} --worker ${workerId} --command "node -e \\"console.log('hello from '+process.env.NADO_WORKER_ID)\\"" --wait`);
-    console.log(`installContextExample=NADO_TOKEN=${token} node ./src/cli.js context install --control ${advertisedControlUrl} --out ./AGENTS.md`);
+    console.log(`submitExample=NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js submit --control ${advertisedControlUrl} --worker ${workerId} --command "node -e \\"console.log('hello from '+process.env.NADO_WORKER_ID)\\"" --wait`);
+    console.log(`installContextExample=NADO_TOKEN="$NADO_TOKEN" node ./src/cli.js context install --control ${advertisedControlUrl} --out ./AGENTS.md`);
     console.log('press Ctrl+C to stop quickstart');
 
     if (args.once) {
@@ -598,6 +990,12 @@ async function commandWorkerStart(args) {
     maxConcurrency: Number(args['max-concurrency'] || args.concurrency || 1),
     cleanupWorkspaces: Boolean(args['cleanup-workspaces']),
     pollMs: Number(args['poll-ms'] || 2_000),
+    longPollMs: Number(args['long-poll-ms'] ?? process.env.NADO_WORKER_LONG_POLL_MS ?? 20_000),
+    reconnectBaseMs: Number(args['reconnect-base-ms'] || process.env.NADO_WORKER_RECONNECT_BASE_MS || 0) || undefined,
+    reconnectMaxMs: Number(args['reconnect-max-ms'] || process.env.NADO_WORKER_RECONNECT_MAX_MS || 0) || undefined,
+    ...workerCompletionOptionsFromArgs(args),
+    networkProbeBytes: args['network-probe-bytes'] ?? process.env.NADO_NETWORK_PROBE_BYTES,
+    networkProbeIntervalMs: args['network-probe-interval-ms'] ?? process.env.NADO_NETWORK_PROBE_INTERVAL_MS,
     onLog: (line) => console.log(`[worker:${id}] ${line}`),
   });
 
@@ -606,10 +1004,70 @@ async function commandWorkerStart(args) {
   await worker.done;
 }
 
+function strictLocalReadinessPolicy(capabilities, agentOptions) {
+  const normalizedCapabilities = capabilities.map((item) => String(item).trim().toLowerCase());
+  const realAgentPreset = ['codex', 'claude'].includes(agentOptions.agentPreset)
+    ? agentOptions.agentPreset
+    : null;
+  return {
+    requireGpu: normalizedCapabilities.includes('gpu'),
+    requireAgent: Boolean(realAgentPreset),
+    requiredTools: realAgentPreset ? [realAgentPreset] : [],
+  };
+}
+
+async function runStrictLocalReadinessGate({
+  capabilities,
+  agentOptions,
+  dataDir,
+  identity = null,
+  inventory,
+  requireIdentity = false,
+  phase,
+}) {
+  const policy = strictLocalReadinessPolicy(capabilities, agentOptions);
+  const report = await inspectLocalWorker({
+    dataDir,
+    capabilities,
+    agentCommand: agentOptions.agentCommand,
+    agentPreset: agentOptions.agentPreset,
+    identity,
+    inventory,
+    requireGpu: policy.requireGpu,
+    requireAgent: policy.requireAgent,
+    requireIdentity,
+    requiredTools: policy.requiredTools,
+  });
+  console.log(`localReadiness=${report.ok ? 'ok' : 'failed'} phase=${phase}`);
+  for (const item of report.checks.filter((check) => check.required)) {
+    console.log(`localReadinessCheck=${item.key} status=${item.status}`);
+    if (item.status === 'failed' && item.nextAction) {
+      console.log(`localReadinessNextAction=${item.key}: ${item.nextAction}`);
+    }
+  }
+  if (!report.ok) {
+    process.exitCode = 2;
+  }
+  return report.ok;
+}
+
 async function commandWorkerBootstrapStart(args) {
   const controlUrl = controlUrlFrom(args);
   const dataDir = path.resolve(args['data-dir'] || '.nado');
   const agentOptions = agentOptionsFromArgs(args);
+  const capabilities = valueList(args.capability || args.capabilities);
+  const strictLocalReadiness = Boolean(args['strict-local-readiness']);
+  const inspectionInventory = strictLocalReadiness ? await collectInventory(capabilities) : null;
+  if (strictLocalReadiness && !await runStrictLocalReadinessGate({
+    capabilities,
+    agentOptions,
+    dataDir,
+    identity: null,
+    inventory: inspectionInventory,
+    phase: 'pre-enrollment',
+  })) {
+    return;
+  }
   const enrollmentToken = args['enrollment-token'] || process.env.NADO_ENROLLMENT_TOKEN;
   let identity = await ensureEnrolledWorker({
     id: args.id || undefined,
@@ -623,6 +1081,23 @@ async function commandWorkerBootstrapStart(args) {
   console.log(`worker=${identity.workerId}`);
   console.log(`workerToken=${identity.workerTokenId}`);
   console.log(`publicKey=${identity.publicKeyPem.split('\n')[1]?.slice(0, 16) || 'ok'}...`);
+  if (identity.tokenRotation?.status === 'pending') {
+    try {
+      const resumed = await confirmPendingWorkerTokenRotation({
+        identity,
+        dataDir,
+        controlUrl,
+      });
+      identity = resumed.identity;
+      console.log('tokenRotation=recovered');
+      console.log(`workerToken=${identity.workerTokenId}`);
+    } catch (error) {
+      if (!enrollmentToken || ![401, 403, 410].includes(Number(error.status || 0))) {
+        throw error;
+      }
+      console.log('tokenRotation=recovery-auth-failed');
+    }
+  }
   try {
     await runWorkerPreflight({
       id: identity.workerId,
@@ -667,6 +1142,18 @@ async function commandWorkerBootstrapStart(args) {
     });
   }
 
+  if (strictLocalReadiness && !await runStrictLocalReadinessGate({
+    capabilities,
+    agentOptions,
+    dataDir,
+    identity,
+    inventory: inspectionInventory,
+    requireIdentity: true,
+    phase: 'post-preflight',
+  })) {
+    return;
+  }
+
   const worker = await startWorker({
     id: identity.workerId,
     name: args.name || identity.workerId,
@@ -674,13 +1161,28 @@ async function commandWorkerBootstrapStart(args) {
     token: identity.workerToken,
     privateKeyPem: identity.privateKeyPem,
     dataDir,
-    capabilities: valueList(args.capability || args.capabilities),
+    capabilities,
     labels: parseLabels(args.label),
     agentCommand: agentOptions.agentCommand,
     agentPreset: agentOptions.agentPreset,
     maxConcurrency: Number(args['max-concurrency'] || args.concurrency || 1),
     cleanupWorkspaces: Boolean(args['cleanup-workspaces']),
     pollMs: Number(args['poll-ms'] || 2_000),
+    longPollMs: Number(args['long-poll-ms'] ?? process.env.NADO_WORKER_LONG_POLL_MS ?? 20_000),
+    reconnectBaseMs: Number(args['reconnect-base-ms'] || process.env.NADO_WORKER_RECONNECT_BASE_MS || 0) || undefined,
+    reconnectMaxMs: Number(args['reconnect-max-ms'] || process.env.NADO_WORKER_RECONNECT_MAX_MS || 0) || undefined,
+    ...workerCompletionOptionsFromArgs(args),
+    networkProbeBytes: args['network-probe-bytes'] ?? process.env.NADO_NETWORK_PROBE_BYTES,
+    networkProbeIntervalMs: args['network-probe-interval-ms'] ?? process.env.NADO_NETWORK_PROBE_INTERVAL_MS,
+    credentialRotationIntervalMs: args['token-rotation-interval-ms']
+      ?? process.env.NADO_WORKER_TOKEN_ROTATION_INTERVAL_MS,
+    rotateCredentials: ({ client, verifyPreviousToken }) => rotateEnrolledWorkerToken({
+      dataDir,
+      controlUrl,
+      client,
+      ttlMs: args['token-rotation-ttl-ms'],
+      verifyPreviousToken,
+    }),
     once: Boolean(args.once),
     onLog: (line) => console.log(`[worker:${identity.workerId}] ${line}`),
   });
@@ -699,7 +1201,24 @@ async function runWorkerPreflight({ id, dataDir, controlUrl, client }) {
   await fs.mkdir(dataDir, { recursive: true });
   await fs.access(dataDir);
 
-  const health = await client.health();
+  const { health, clock } = await probeControlClock(client);
+  console.log(`clock=${clock.status}`);
+  if (clock.available) {
+    console.log(`clockOffsetMs=${clock.offsetMs}`);
+    console.log(`clockUncertaintyMs=${clock.uncertaintyMs}`);
+    console.log(`clockWindowRemainingMs=${clock.remainingWindowMs}`);
+  }
+  if (clock.nextAction) {
+    console.log(`clockNextAction=${clock.nextAction}`);
+  }
+  if (clock.status === 'failed') {
+    const error = new Error(
+      `Control/Worker clock skew is unsafe for signed requests: offset=${clock.offsetMs}ms, uncertainty=${clock.uncertaintyMs}ms, allowed=${clock.maxClockSkewMs}ms`,
+    );
+    error.code = 'NADO_WORKER_CLOCK_SKEW';
+    error.clock = clock;
+    throw error;
+  }
   const remote = await client.workerPreflight(id);
 
   console.log('preflight=ok');
@@ -721,6 +1240,53 @@ async function commandWorkerPreflight(args) {
     controlUrl: controlUrlFrom(args),
     client: makeClient(args),
   });
+}
+
+async function commandWorkerInspect(args) {
+  const dataDir = path.resolve(args['data-dir'] || '.nado');
+  const agentOptions = agentOptionsFromArgs(args);
+  const report = await inspectLocalWorker({
+    dataDir,
+    capabilities: valueList(args.capability || args.capabilities),
+    agentCommand: agentOptions.agentCommand,
+    agentPreset: agentOptions.agentPreset,
+    requireGpu: Boolean(args['require-gpu']),
+    requireAgent: Boolean(args['require-agent']),
+    requireIdentity: Boolean(args['require-identity']),
+    requiredCapabilities: valueList(args['require-capability'] || args['required-capabilities']),
+    requiredTools: parseTools(args['require-tool'] || args.tool || args.tools),
+    requiredResources: resourceRequirementsFromArgs(args),
+  });
+  const output = args.out ? await writeNewPrivateJson(args.out, report) : null;
+  if (args.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`workerInspect=${report.ok ? 'ok' : 'failed'}`);
+    console.log(`host=${report.host.hostname || '-'} platform=${report.host.platform || '-'} arch=${report.host.arch || '-'}`);
+    console.log(`node=${report.tools.node?.version || process.version}`);
+    console.log(`capabilities=${report.capabilities.join(',') || '-'}`);
+    console.log(`cpu=${report.resources.cpuCores}`);
+    console.log(`memory=${formatMetricBytes(report.resources.memoryBytes)}`);
+    console.log(`gpus=${report.resources.allGpus.length
+      ? report.resources.allGpus.map((gpu) => `${gpu.name}:${formatMetricBytes(gpu.memoryTotalBytes)}`).join(',')
+      : '-'}`);
+    console.log(`agent=${report.readiness.agent.mode}:${report.readiness.agent.status}`);
+    console.log(`identity=${report.identity.present
+      ? `${report.identity.workerId}:${report.identity.signedKeyReady ? 'signed' : 'invalid'}`
+      : 'not-enrolled'}`);
+    for (const item of report.checks) {
+      console.log(`check=${item.key} status=${item.status}${item.required ? ' required=true' : ''}`);
+      if (item.status === 'failed' && item.nextAction) {
+        console.log(`nextAction=${item.key}: ${item.nextAction}`);
+      }
+    }
+    if (output) {
+      console.log(`report=${output}`);
+    }
+  }
+  if (!report.ok) {
+    process.exitCode = 2;
+  }
 }
 
 async function commandAgents() {
@@ -868,6 +1434,11 @@ async function commandWorkerBundle(args) {
   console.log(`root=${bundle.bundleRoot}`);
   console.log(`files=${bundle.files.length}`);
   console.log(`bytes=${bundle.bytes.length}`);
+  console.log(`upgradeDataDir=${bundle.manifest.dataDir}`);
+  console.log(`upgradeReady=${bundle.manifest.upgrade.dataDirIsAbsolute}`);
+  if (!bundle.manifest.upgrade.dataDirIsAbsolute) {
+    console.log('warning=Relative Worker data directory is tied to the extracted bundle. Use the same absolute --data-dir outside runtime folders for production upgrade/rollback.');
+  }
   console.log('start=bash ./start-worker.sh');
   console.log('startPowerShell=.\\start-worker.ps1');
 }
@@ -922,6 +1493,7 @@ async function commandWorkerBootstrapBundle(args) {
     agentPreset: agentOptions.agentPreset,
     agentCommand: args['agent-command'] || null,
     maxConcurrency: args['max-concurrency'] || args.concurrency || null,
+    strictLocalReadiness: Boolean(args['strict-local-readiness']),
     cleanupWorkspaces: Boolean(args['cleanup-workspaces']),
     pollMs: args['poll-ms'] || null,
     dataDir: args['data-dir'] || '.nado',
@@ -943,6 +1515,11 @@ async function commandWorkerBootstrapBundle(args) {
   console.log(`root=${bundle.bundleRoot}`);
   console.log(`files=${bundle.files.length}`);
   console.log(`bytes=${bundle.bytes.length}`);
+  console.log(`upgradeDataDir=${bundle.manifest.dataDir}`);
+  console.log(`upgradeReady=${bundle.manifest.upgrade.dataDirIsAbsolute}`);
+  if (!bundle.manifest.upgrade.dataDirIsAbsolute) {
+    console.log('warning=Relative Worker data directory is tied to the extracted bundle. Use the same absolute --data-dir outside runtime folders for production upgrade/rollback.');
+  }
   console.log('start=bash ./start-worker.sh');
   console.log('startPowerShell=.\\start-worker.ps1');
 }
@@ -962,6 +1539,56 @@ async function commandWorkerTokenCreate(args) {
   console.log(`token=${result.token}`);
 }
 
+async function commandWorkerTokenRotate(args) {
+  const dataDir = path.resolve(args['data-dir'] || '.nado');
+  const before = await readWorkerIdentity(dataDir);
+  if ((args.verify || args.evidence) && before?.tokenRotation?.status === 'pending') {
+    throw new Error('Cannot prove predecessor rejection while recovering a pending rotation; recover it first, then run a fresh verified rotation');
+  }
+  const result = await rotateEnrolledWorkerToken({
+    dataDir,
+    controlUrl: controlUrlFrom(args),
+    ttlMs: args['ttl-ms'],
+    verifyPreviousToken: Boolean(args.verify || args.evidence),
+  });
+  console.log(`rotated ${result.identity.workerTokenId}`);
+  console.log(`worker=${result.identity.workerId}`);
+  console.log(`previousToken=${result.identity.lastTokenRotation?.fromTokenId || '-'}`);
+  console.log(`workerToken=${result.identity.workerTokenId}`);
+  console.log(`confirmedAt=${result.identity.lastTokenRotation?.confirmedAt || '-'}`);
+  console.log(`recovered=${Boolean(result.recovered)}`);
+  if (result.verification) {
+    console.log(`newTokenAccepted=${Boolean(result.verification.newTokenAccepted)}`);
+    console.log(`previousTokenRejected=${Boolean(result.verification.previousTokenRejected)}`);
+    console.log(`previousTokenStatus=${result.verification.previousTokenStatus || '-'}`);
+    if (!result.verification.passed) {
+      throw new Error(`Credential rotation completed, but verification failed: ${result.verification.reason || 'unknown reason'}`);
+    }
+  }
+  if (args.evidence) {
+    const output = await recordAcceptanceEvidenceFile(args.evidence, {
+      scenario: 'credentialRevocation',
+      status: 'passed',
+      evidence: `Worker ${result.identity.workerId} accepted replacement token ${result.identity.workerTokenId}; predecessor ${result.identity.lastTokenRotation?.fromTokenId || '-'} was rejected with HTTP ${result.verification.previousTokenStatus}.`,
+      references: [
+        `worker:${result.identity.workerId}`,
+        `worker-token:${result.identity.workerTokenId}`,
+        `worker-token:${result.identity.lastTokenRotation?.fromTokenId || '-'}`,
+      ],
+      observedAt: result.verification.checkedAt,
+      source: 'automated_exercise',
+      details: {
+        mode: 'direct_verified_rotation',
+        workerId: result.identity.workerId,
+        replacementTokenId: result.identity.workerTokenId,
+        predecessorTokenId: result.identity.lastTokenRotation?.fromTokenId || null,
+        verification: result.verification,
+      },
+    });
+    console.log(`acceptanceEvidence=${output}`);
+  }
+}
+
 async function commandWorkerTokens(args) {
   const client = makeClient(args);
   const { workerTokens } = await client.listWorkerTokens({ workerId: args.worker || args.id });
@@ -973,6 +1600,8 @@ async function commandWorkerTokens(args) {
     { header: 'created', value: (item) => item.createdAt },
     { header: 'lastUsed', value: (item) => item.lastUsedAt || '-' },
     { header: 'expires', value: (item) => item.expiresAt || '-' },
+    { header: 'rotation', value: (item) => item.rotationStatus || '-' },
+    { header: 'rotatesFrom', value: (item) => item.rotationFromTokenId || '-' },
     { header: 'revoked', value: (item) => item.revokedAt || '-' },
   ]);
 }
@@ -1051,17 +1680,43 @@ async function commandWorkerEnrollmentPrune(args) {
 
 async function commandWorkers(args) {
   const client = makeClient(args);
-  const { workers } = await client.listWorkers();
+  const [{ workers }, snapshot] = await Promise.all([client.listWorkers(), client.status()]);
+  const controlBuild = snapshot.runtime?.build || null;
+  console.log(`controlBuild=${controlBuild?.buildId || '-'} protocol=${controlBuild?.protocolVersion || '-'}`);
   printTable(workers, [
     { header: 'id', value: (worker) => worker.id },
+    { header: 'build', value: (worker) => {
+      const compatibility = runtimeBuildCompatibility(controlBuild, worker.runtime?.build);
+      return `${compatibility.status}:${worker.runtime?.build?.buildId || '-'}`;
+    } },
     { header: 'gateway', value: (worker) => worker.gatewayState },
     { header: 'admin', value: (worker) => worker.adminState },
     { header: 'observed', value: (worker) => worker.observedState },
     { header: 'currentTask', value: (worker) => worker.currentTaskId || '-' },
     { header: 'slots', value: (worker) => `${worker.runningSlots ?? worker.runningTasks ?? 0}/${worker.maxConcurrency || 1}` },
     { header: 'capabilities', value: (worker) => worker.capabilities.join(',') || '-' },
+    { header: 'identity', value: (worker) => worker.identity?.signed
+      ? `signed:${worker.identity.workerTokenId || 'worker'}`
+      : worker.identity?.type || 'unknown' },
+    { header: 'clock', value: (worker) => Number.isFinite(Number(worker.identity?.signatureClockSkewMs))
+      ? `${Math.round(Number(worker.identity.signatureClockSkewMs))}ms`
+      : '-' },
+    { header: 'source', value: (worker) => worker.connection?.remoteAddress || '-' },
+    { header: 'transport', value: (worker) => worker.connection
+      ? `${worker.connection.protocol || '-'}${worker.connection.trustedProxy
+        ? worker.connection.proxyAuthenticated ? ':proxy-auth' : ':proxy-unverified'
+        : ':direct'}`
+      : '-' },
     { header: 'labels', value: (worker) => formatLabels(worker.labels) },
     { header: 'tools', value: (worker) => Object.entries(worker.inventory?.tools || {}).filter(([, tool]) => tool.available).map(([name]) => name).join(',') || '-' },
+    { header: 'cpu', value: (worker) => Number.isFinite(Number(worker.resources?.cpu?.utilizationPercent)) ? `${worker.resources.cpu.utilizationPercent}%` : '-' },
+    { header: 'memFree', value: (worker) => worker.resources?.memory?.totalBytes ? `${formatMetricBytes(worker.resources.memory.freeBytes)}${worker.resources.memory.usedPercent == null ? '' : `/${worker.resources.memory.usedPercent}% used`}` : '-' },
+    { header: 'rtt', value: (worker) => Number.isFinite(Number(worker.resources?.network?.roundTripMs)) ? `${worker.resources.network.roundTripMs}ms` : '-' },
+    { header: 'bandwidth', value: (worker) => worker.resources?.network?.bandwidth?.available
+      ? `D:${formatBandwidth(worker.resources.network.bandwidth.downloadBytesPerSecond)}/U:${formatBandwidth(worker.resources.network.bandwidth.uploadBytesPerSecond)}`
+      : '-' },
+    { header: 'diskFree', value: (worker) => worker.resources?.disk?.available ? formatMetricBytes(worker.resources.disk.availableBytes) : '-' },
+    { header: 'temp', value: (worker) => (worker.resources?.temperatures || []).length ? `${Math.max(...worker.resources.temperatures.map((item) => Number(item.temperatureC) || 0))}C` : '-' },
     { header: 'agent', value: (worker) => (worker.agentCommandConfigured ? worker.agentPreset || 'custom' : 'no') },
     { header: 'agentTest', value: (worker) => worker.diagnostics?.agentSelfTest?.status || '-' },
     { header: 'lastSeen', value: (worker) => worker.lastSeenAt || '-' },
@@ -1100,6 +1755,20 @@ async function commandWorkerLogs(args) {
   }
 }
 
+async function waitForWorkerCommand(client, workerId, commandId, timeoutMs = 60_000) {
+  const startedAt = Date.now();
+  let last = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    const { worker } = await client.getWorker(workerId);
+    last = (worker.commands || []).find((command) => command.id === commandId) || null;
+    if (last && ['completed', 'failed'].includes(last.status)) {
+      return last;
+    }
+    await sleep(250);
+  }
+  throw new Error(`Timed out waiting for Worker command ${commandId}; last status=${last?.status || 'missing'}`);
+}
+
 async function commandWorkerManage(args) {
   const id = requireValue(args.id, 'Worker manage requires --id');
   const action = requireValue(args.action, 'Worker manage requires --action');
@@ -1116,6 +1785,50 @@ async function commandWorkerManage(args) {
   console.log(`queued ${command.id} action=${command.action} for ${worker.id}`);
   console.log(`adminState=${worker.adminState}`);
   console.log(`gatewayState=${worker.gatewayState}`);
+  if (!args.wait && !args.evidence) {
+    return;
+  }
+  const completed = await waitForWorkerCommand(client, id, command.id, Number(args.timeout || 60_000));
+  console.log(`commandStatus=${completed.status}`);
+  console.log(`commandMessage=${completed.message || '-'}`);
+  if (completed.status !== 'completed') {
+    throw new Error(`Worker command ${completed.id} failed: ${completed.message || 'unknown error'}`);
+  }
+  if (action === 'rotate_token') {
+    console.log(`newTokenAccepted=${Boolean(completed.result?.verification?.newTokenAccepted)}`);
+    console.log(`previousTokenRejected=${Boolean(completed.result?.verification?.previousTokenRejected)}`);
+    console.log(`previousTokenStatus=${completed.result?.verification?.previousTokenStatus || '-'}`);
+  }
+  if (args.evidence) {
+    if (action !== 'rotate_token') {
+      throw new Error('--evidence is currently supported only for --action rotate_token');
+    }
+    if (!completed.result?.verification?.passed) {
+      throw new Error('Worker command completed without verified replacement acceptance and predecessor rejection');
+    }
+    const output = await recordAcceptanceEvidenceFile(args.evidence, {
+      scenario: 'credentialRevocation',
+      status: 'passed',
+      evidence: `Control-triggered rotation on Worker ${id} accepted replacement token ${completed.result.workerTokenId}; predecessor ${completed.result.previousTokenId} was rejected with HTTP ${completed.result.verification.previousTokenStatus}.`,
+      references: [
+        `worker:${id}`,
+        `worker-command:${completed.id}`,
+        `worker-token:${completed.result.workerTokenId}`,
+        `worker-token:${completed.result.previousTokenId}`,
+      ],
+      observedAt: completed.result.verification.checkedAt,
+      source: 'automated_exercise',
+      details: {
+        mode: 'control_triggered_rotation',
+        workerId: id,
+        commandId: completed.id,
+        replacementTokenId: completed.result.workerTokenId,
+        predecessorTokenId: completed.result.previousTokenId,
+        verification: completed.result.verification,
+      },
+    });
+    console.log(`acceptanceEvidence=${output}`);
+  }
 }
 
 async function commandStatus(args) {
@@ -1125,10 +1838,16 @@ async function commandStatus(args) {
   const taskCounts = snapshot.tasks.counts;
   const batchCounts = snapshot.batches.counts;
   const attention = snapshot.tasks.attention || { total: 0, items: [] };
+  const controlBuild = snapshot.runtime?.build || null;
+  const dataLease = snapshot.storage?.dataLease || {};
+  console.log(`controlBuild=${controlBuild?.buildId || '-'} protocol=${controlBuild?.protocolVersion || '-'}`);
+  console.log(`storage=${snapshot.storage?.backend || '-'} dataLease=${dataLease.status || 'unavailable'} writeFencing=${Boolean(dataLease.writeFencing)}`);
   console.log(`workers=${snapshot.workers.total} active=${snapshot.workers.active}`);
   console.log(`sessions=${snapshot.sessions.total} open=${snapshot.sessions.open}`);
   console.log(`tasks=${snapshot.tasks.total} queued=${taskCounts.queued || 0} running=${taskCounts.running || 0} succeeded=${taskCounts.succeeded || 0} failed=${taskCounts.failed || 0} cancelled=${taskCounts.cancelled || 0} attention=${attention.total || 0}`);
   console.log(`batches=${snapshot.batches.total} queued=${batchCounts.queued || 0} running=${batchCounts.running || 0} succeeded=${batchCounts.succeeded || 0} completed_with_errors=${batchCounts.completed_with_errors || 0}`);
+  const auditSink = snapshot.security?.auditSink || {};
+  console.log(`auditSink=${auditSink.state || 'disabled'} integrity=${auditSink.deliveryIntegrity || 'disabled'} written=${auditSink.writtenEvents || 0} failed=${auditSink.failedEvents || 0} dropped=${auditSink.droppedEvents || 0} pending=${auditSink.pendingWrites || 0}/${auditSink.maxPendingWrites || 0}${auditSink.lastErrorCode ? ` lastError=${auditSink.lastErrorCode}` : ''}`);
   if (attention.total) {
     console.log('attention:');
     for (const task of attention.items || []) {
@@ -1137,6 +1856,10 @@ async function commandStatus(args) {
   }
   printTable(workers, [
     { header: 'id', value: (worker) => worker.id },
+    { header: 'build', value: (worker) => {
+      const compatibility = runtimeBuildCompatibility(controlBuild, worker.runtime?.build);
+      return `${compatibility.status}:${worker.runtime?.build?.buildId || '-'}`;
+    } },
     { header: 'gateway', value: (worker) => worker.gatewayState },
     { header: 'admin', value: (worker) => worker.adminState },
     { header: 'task', value: (worker) => worker.currentTaskId || '-' },
@@ -1146,6 +1869,412 @@ async function commandStatus(args) {
     { header: 'tools', value: (worker) => Object.entries(worker.inventory?.tools || {}).filter(([, tool]) => tool.available).map(([name]) => name).join(',') || '-' },
     { header: 'agentTest', value: (worker) => worker.diagnostics?.agentSelfTest?.status || '-' },
   ]);
+}
+
+async function commandAudit(args) {
+  const client = makeClient(args);
+  const options = {
+    tail: Number(args.tail ?? 100),
+    actorType: args['actor-type'],
+    outcome: args.outcome,
+    statusCode: args['status-code'],
+  };
+  if (args.out) {
+    const output = path.resolve(args.out);
+    const text = await client.exportAuditEvents(options);
+    await fs.mkdir(path.dirname(output), { recursive: true });
+    await fs.writeFile(output, text, { mode: 0o600 });
+    await fs.chmod(output, 0o600);
+    console.log(`auditExport=${output}`);
+    console.log(`auditEvents=${text.trim() ? text.trim().split(/\r?\n/).length : 0}`);
+    return;
+  }
+  const { auditEvents } = await client.listAuditEvents(options);
+  if (args.json) {
+    console.log(JSON.stringify(auditEvents, null, 2));
+    return;
+  }
+  printTable([...auditEvents].reverse(), [
+    { header: 'at', value: (event) => event.at },
+    { header: 'actor', value: (event) => `${event.actorType}:${event.actorId || '-'}` },
+    { header: 'method', value: (event) => event.method },
+    { header: 'path', value: (event) => event.path },
+    { header: 'status', value: (event) => event.statusCode },
+    { header: 'outcome', value: (event) => event.outcome },
+    { header: 'request', value: (event) => event.requestId || '-' },
+  ]);
+}
+
+async function writeNewPrivateJson(file, value) {
+  const output = path.resolve(file);
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(output, `${JSON.stringify(value, null, 2)}\n`, {
+    flag: 'wx',
+    mode: 0o600,
+  });
+  await fs.chmod(output, 0o600);
+  return output;
+}
+
+async function writeNewPrivateText(file, value) {
+  const output = path.resolve(file);
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(output, String(value), {
+    flag: 'wx',
+    mode: 0o600,
+  });
+  await fs.chmod(output, 0o600);
+  return output;
+}
+
+async function writePrivateJsonAtomic(file, value) {
+  const output = path.resolve(file);
+  const temporary = `${output}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  try {
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    await fs.rename(temporary, output);
+    await fs.chmod(output, 0o600).catch(() => {});
+  } finally {
+    await fs.rm(temporary, { force: true }).catch(() => {});
+  }
+  return output;
+}
+
+async function recordAcceptanceEvidenceFile(file, record) {
+  const output = path.resolve(file);
+  let current;
+  try {
+    current = JSON.parse(await fs.readFile(output, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+    current = acceptanceEvidenceTemplate();
+  }
+  return writePrivateJsonAtomic(output, recordAcceptanceEvidence(current, record));
+}
+
+async function commandAcceptanceTemplate(args) {
+  const template = acceptanceEvidenceTemplate();
+  if (args.json && !args.out) {
+    console.log(JSON.stringify(template, null, 2));
+    return;
+  }
+  const output = await writeNewPrivateJson(
+    requireValue(args.out, 'acceptance template requires --out <evidence.json> or --json'),
+    template,
+  );
+  console.log(`acceptanceEvidence=${output}`);
+}
+
+async function commandAcceptanceEvidenceRecord(args) {
+  const file = requireValue(args.file || args.evidence, 'acceptance evidence record requires --file <evidence.json>');
+  const scenario = requireValue(args.scenario, 'acceptance evidence record requires --scenario <name>');
+  const status = requireValue(args.status, 'acceptance evidence record requires --status passed|failed|pending');
+  const output = await recordAcceptanceEvidenceFile(file, {
+    scenario,
+    status,
+    note: args.note || '',
+    references: valueList(args.reference || args.references),
+    observedAt: args['observed-at'] || undefined,
+  });
+  console.log(`acceptanceEvidence=${output}`);
+  console.log(`scenario=${scenario}`);
+  console.log(`status=${status}`);
+}
+
+async function commandAcceptanceEvidenceInit(args) {
+  const file = requireValue(args.file || args.evidence, 'acceptance evidence init requires --file <evidence.json>');
+  const output = path.resolve(file);
+  let current;
+  let created = false;
+  try {
+    current = JSON.parse(await fs.readFile(output, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+    created = true;
+  }
+  const initialized = initializeAcceptanceEvidence(current);
+  const changed = created || JSON.stringify(current) !== JSON.stringify(initialized);
+  if (changed) {
+    await writePrivateJsonAtomic(output, initialized);
+  }
+  if (args.json) {
+    console.log(JSON.stringify({ file: output, created, updated: !created && changed, evidence: initialized }, null, 2));
+    return;
+  }
+  console.log(`acceptanceEvidence=${output}`);
+  console.log(`status=${created ? 'created' : changed ? 'updated' : 'ready'}`);
+}
+
+async function commandAcceptanceRunbook(args) {
+  const runbook = buildAcceptanceRunbook({
+    controlUrl: controlUrlFrom(args),
+    workerId: requireValue(args.worker, 'acceptance runbook requires --worker <worker-id>'),
+    deploymentMode: args['deployment-mode'] || args.deploymentMode,
+    overlayInterface: args['overlay-interface'] || args.overlayInterface,
+    requireGpu: Boolean(args['require-gpu']),
+    requireAgent: !args['no-require-agent'],
+    sourceDataDir: args['source-data-dir'],
+    backupDir: args['backup-dir'],
+    restoredDataDir: args['restored-data-dir'],
+    backendControlUrl: args.backend,
+    evidenceFile: args.evidence,
+    deploymentReport: args['deployment-report'],
+    acceptanceReport: args['acceptance-report'],
+  });
+  const output = args.out ? await writeNewPrivateText(args.out, runbook.script) : null;
+  if (args.json) {
+    console.log(JSON.stringify({ ...runbook, output }, null, 2));
+    return;
+  }
+  if (output) {
+    console.log(`acceptanceRunbook=${output}`);
+    console.log(`steps=${runbook.steps.length}`);
+    console.log(`operatorEditsRequired=${runbook.operatorEditsRequired.join(',') || '-'}`);
+    return;
+  }
+  process.stdout.write(runbook.script);
+}
+
+async function commandAcceptanceExercise(args) {
+  const exercise = args._[2];
+  if (!['remote-cancellation', 'agent-collaboration', 'short-disconnect', 'long-disconnect-recovery', 'vm-restart-recovery', 'worker-restart-recovery', 'large-artifact-resume', 'large-input-resume', 'backup-restore'].includes(exercise)) {
+    throw new Error('Usage: nado acceptance exercise remote-cancellation|agent-collaboration|short-disconnect|long-disconnect-recovery|vm-restart-recovery|worker-restart-recovery|large-artifact-resume|large-input-resume|backup-restore --control URL --worker ID --evidence FILE');
+  }
+  const workerId = requireValue(args.worker, 'acceptance exercise requires --worker <worker-id>');
+  const evidenceFile = requireValue(
+    args.evidence || args.file,
+    'acceptance exercise requires --evidence <evidence.json>',
+  );
+  const client = makeClient(args);
+  const agentCollaboration = exercise === 'agent-collaboration';
+  const shortDisconnect = exercise === 'short-disconnect';
+  const longDisconnectRecovery = exercise === 'long-disconnect-recovery';
+  const vmRestartRecovery = exercise === 'vm-restart-recovery';
+  const workerRestartRecovery = exercise === 'worker-restart-recovery';
+  const largeArtifactResume = exercise === 'large-artifact-resume';
+  const largeInputResume = exercise === 'large-input-resume';
+  const backupRestore = exercise === 'backup-restore';
+  const reportProgress = (progress) => {
+    const line = `[acceptance:${exercise}] ${progress.message}`;
+    if (args.json) {
+      console.error(line);
+    } else {
+      console.log(line);
+    }
+  };
+  let result;
+  if (agentCollaboration) {
+    result = await runAgentCollaborationExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 180_000),
+    });
+  } else if (shortDisconnect) {
+    result = await runShortDisconnectExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 180_000),
+      minDisconnectMs: Number(args['min-disconnect-ms'] || 5_000),
+      taskDurationMs: Number(args['task-duration-ms'] || 90_000),
+      onProgress: reportProgress,
+    });
+  } else if (longDisconnectRecovery) {
+    result = await runLongDisconnectRecoveryExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 300_000),
+      firstAttemptMs: Number(args['first-attempt-ms'] || 0) || undefined,
+      onProgress: reportProgress,
+    });
+  } else if (vmRestartRecovery) {
+    result = await runVmRestartRecoveryExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 300_000),
+      taskDurationMs: Number(args['task-duration-ms'] || 90_000),
+      onProgress: reportProgress,
+    });
+  } else if (workerRestartRecovery) {
+    result = await runWorkerRestartRecoveryExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 300_000),
+      onProgress: reportProgress,
+    });
+  } else if (largeArtifactResume) {
+    result = await runLargeArtifactResumeExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 300_000),
+      artifactBytes: Number(args['artifact-bytes'] || 64 * 1024 * 1024),
+      minStallMs: Number(args['min-stall-ms'] || 5_000),
+      onProgress: reportProgress,
+    });
+  } else if (largeInputResume) {
+    result = await runLargeInputResumeExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 300_000),
+      inputBytes: Number(args['input-bytes'] || 64 * 1024 * 1024),
+      minStallMs: Number(args['min-stall-ms'] || 5_000),
+      onProgress: reportProgress,
+    });
+  } else if (backupRestore) {
+    result = await runBackupRestoreExercise(client, {
+      workerId,
+      sourceDataDir: requireValue(args['source-data-dir'], 'backup-restore requires --source-data-dir <active-control-data-dir>'),
+      backupDir: requireValue(args['backup-dir'], 'backup-restore requires --backup-dir <new-backup-dir>'),
+      restoredDataDir: requireValue(args['restored-data-dir'], 'backup-restore requires --restored-data-dir <new-restored-data-dir>'),
+      timeoutMs: Number(args.timeout || 600_000),
+      onProgress: reportProgress,
+    });
+  } else {
+    result = await runRemoteCancellationExercise(client, {
+      workerId,
+      timeoutMs: Number(args.timeout || 60_000),
+    });
+  }
+  const supervised = shortDisconnect || longDisconnectRecovery || vmRestartRecovery || workerRestartRecovery || largeArtifactResume || largeInputResume || backupRestore;
+  let scenario = 'remoteCancellation';
+  let exerciseLabel = 'remote cancellation';
+  let successNote = `Automated remote cancellation exercise passed on ${workerId}: task ${result.taskId} was cancelled, the Worker acknowledged cancel_current, and released the task process`;
+  if (agentCollaboration) {
+    scenario = 'agentCollaboration';
+    exerciseLabel = 'Agent collaboration';
+    successNote = `Automated Agent collaboration exercise passed on ${workerId}: session ${result.sessionId} completed two target-pinned Agent turns and verified plan, final, and transcript artifacts`;
+  } else if (shortDisconnect) {
+    scenario = 'shortDisconnect';
+    exerciseLabel = 'short disconnect';
+    successNote = `Supervised short-disconnect exercise passed on ${workerId}: task ${result.taskId} observed a ${Math.round(result.observedGap.ageMs)}ms heartbeat gap, renewed the same attempt lease, executed once, and completed`;
+  } else if (longDisconnectRecovery) {
+    scenario = 'longDisconnectRecovery';
+    exerciseLabel = 'long disconnect recovery';
+    successNote = `Supervised long-disconnect recovery passed for ${workerId}: task ${result.taskId} expired attempt ${result.attempts[0].id}, rejected its stale result, and completed distinct attempt ${result.attempts[1].id} on ${result.finalWorkerId}`;
+  } else if (vmRestartRecovery) {
+    scenario = 'vmRestartRecovery';
+    exerciseLabel = 'VM restart recovery';
+    successNote = `Supervised VM restart recovery passed for ${workerId}: control changed from ${result.controlRestart.original.instanceId} to ${result.controlRestart.restarted.instanceId}, SQLite preserved task ${result.taskId}, the Worker reconnected, and attempt ${result.attemptId} executed once`;
+  } else if (workerRestartRecovery) {
+    scenario = 'workerRestartRecovery';
+    exerciseLabel = 'Worker service restart recovery';
+    successNote = `Supervised Worker service restart recovery passed for ${workerId}: runtime changed from ${result.runtimeRestart.original.id} to ${result.runtimeRestart.restarted.id}, signed token ${result.tokenContinuity.workerTokenId} remained unchanged, and post-restart task ${result.taskId} completed`;
+  } else if (largeArtifactResume) {
+    scenario = 'largeArtifactResume';
+    exerciseLabel = 'large artifact resume';
+    successNote = `Supervised large-artifact resume passed for ${workerId}: upload ${result.upload.id} stalled at ${result.upload.stalledOffset}/${result.upload.size} bytes, resumed on attempt ${result.attemptId}, and matched SHA-256 ${result.upload.sha256}`;
+  } else if (largeInputResume) {
+    scenario = 'largeInputResume';
+    exerciseLabel = 'large input resume';
+    successNote = `Supervised large-input resume passed for ${workerId}: input ${result.input.id} restarted at byte ${result.input.resumedOffset}/${result.input.size} on attempt ${result.attemptId} and matched SHA-256 ${result.input.sha256}`;
+  } else if (backupRestore) {
+    scenario = 'backupRestore';
+    exerciseLabel = 'backup restore';
+    successNote = `Supervised backup restore passed for ${workerId}: restored control receipt ${result.restoreReceipt.id} verified manifest ${result.restoreReceipt.manifestSha256}, preserved marker task ${result.markerTask.id}, reconnected the Worker, and completed write probe ${result.postRestoreTask.id}`;
+  }
+  const note = result.ok
+    ? successNote
+    : `${supervised ? 'Supervised' : 'Automated'} ${exerciseLabel} exercise failed on ${workerId}: ${result.error || 'unknown failure'}`;
+  const output = await recordAcceptanceEvidenceFile(evidenceFile, {
+    scenario,
+    status: result.ok ? 'passed' : 'failed',
+    note,
+    references: result.references || [],
+    observedAt: result.completedAt,
+    source: supervised ? 'supervised_exercise' : 'automated_exercise',
+    details: result,
+  });
+  if (args.json) {
+    console.log(JSON.stringify({ ...result, evidenceFile: output }, null, 2));
+  } else {
+    console.log(`acceptanceExercise=${exercise}`);
+    console.log(`status=${result.ok ? 'passed' : 'failed'}`);
+    console.log(`worker=${workerId}`);
+    console.log(`session=${result.sessionId || '-'}`);
+    console.log(`task=${result.taskId || result.taskIds?.join(',') || '-'}`);
+    console.log(`evidence=${output}`);
+    if (result.error) {
+      console.log(`error=${result.error}`);
+    }
+  }
+  if (!result.ok) {
+    process.exitCode = 2;
+  }
+}
+
+async function commandAcceptance(args) {
+  const workerId = requireValue(args.worker, 'acceptance requires --worker <worker-id>');
+  const client = makeClient(args);
+  const manualEvidence = args.evidence
+    ? JSON.parse(await fs.readFile(path.resolve(args.evidence), 'utf8'))
+    : {};
+  const deploymentEvidence = args['deployment-evidence']
+    ? JSON.parse(await fs.readFile(path.resolve(args['deployment-evidence']), 'utf8'))
+    : null;
+  const [network, status, capabilities, workerResult, taskResult, sessionResult] = await Promise.all([
+    client.networkInfo(),
+    client.status(),
+    client.capabilities(),
+    client.listWorkers(),
+    client.listTasks(),
+    client.listSessions(),
+  ]);
+  let verifyResult = null;
+  if (args['run-verify']) {
+    verifyResult = await client.verify({
+      workerId,
+      allWorkers: false,
+      requiredCapabilities: args['require-gpu'] ? ['gpu'] : [],
+      timeoutMs: Number(args.timeout || 60_000),
+    });
+  }
+  const report = buildCrossSiteAcceptanceReport({
+    workerId,
+    requireGpu: Boolean(args['require-gpu']),
+    requireAgent: !args['no-require-agent'],
+    // A completion claim must always prove the deployed network boundary. Calls
+    // without --require-complete remain useful as non-strict diagnostic previews.
+    requireDeploymentEvidence: Boolean(args['deployment-evidence'] || args['require-complete']),
+    deploymentEvidence,
+    manualEvidence,
+    network,
+    status,
+    capabilities,
+    workers: workerResult.workers || [],
+    tasks: taskResult.tasks || [],
+    sessions: sessionResult.sessions || [],
+    verifyResult,
+  });
+  let output = null;
+  if (args.out) {
+    output = await writeNewPrivateJson(args.out, report);
+  }
+  if (args.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`crossSiteAcceptance=${report.overall}`);
+    console.log(`worker=${workerId}`);
+    console.log(`checks=${report.summary.passed}/${report.summary.required} failed=${report.summary.failed} pending=${report.summary.pending}`);
+    if (output) {
+      console.log(`report=${output}`);
+    }
+    printTable([...report.automatedChecks, ...report.manualChecks], [
+      { header: 'source', value: (item) => report.automatedChecks.includes(item)
+        ? 'automatic'
+        : item.evidence?.source || 'operator' },
+      { header: 'check', value: (item) => item.key },
+      { header: 'status', value: (item) => item.status },
+      { header: 'summary', value: (item) => item.summary },
+    ]);
+    for (const item of report.nextActions) {
+      console.log(`nextAction=${item.key}: ${item.action}`);
+    }
+  }
+  if (report.overall === 'failed') {
+    process.exitCode = 2;
+  } else if (args['require-complete'] && report.overall !== 'passed') {
+    process.exitCode = 3;
+  }
 }
 
 async function commandNetwork(args) {
@@ -1164,6 +2293,9 @@ async function commandNetwork(args) {
   console.log(`preferredControl=${network.preferredRemoteControlUrl || '-'}`);
   console.log(`publicControl=${network.publicControlUrl || '-'}`);
   console.log(`trustProxy=${network.trustProxy ?? '-'}`);
+  console.log(`trustProxyConfigured=${network.trustProxyConfigured ?? '-'}`);
+  console.log(`proxyAuthenticationConfigured=${network.proxyAuthenticationConfigured ?? '-'}`);
+  console.log(`proxyAuthenticated=${network.proxyAuthenticated ?? '-'}`);
   if (network.nextAction) {
     console.log(`nextAction=${network.nextAction.code || '-'} severity=${network.nextAction.severity || '-'}`);
     console.log(`nextActionControl=${network.nextAction.controlUrl || '-'}`);
@@ -1182,6 +2314,75 @@ async function commandNetwork(args) {
     { header: 'usable', value: (candidate) => candidate.usable !== false ? 'yes' : 'no' },
     { header: 'warning', value: (candidate) => candidate.warning || '-' },
   ]);
+}
+
+async function commandDeploymentCheck(args) {
+  const publicControlUrl = controlUrlFrom(args);
+  const token = tokenFrom(args);
+  const backendControlUrl = args.backend || args['backend-control-url'] || null;
+  let overlayPublishedBindings = null;
+  let overlayPublishedBindingError = null;
+  let controlSecurity = null;
+  let controlSecurityError = null;
+  const composeOptions = {
+    composeFile: args['compose-file'] || 'docker-compose.azure.yml',
+    service: args['compose-service'] || 'control',
+  };
+  if (args.overlay) {
+    try {
+      overlayPublishedBindings = await inspectDockerComposeBindings({
+        ...composeOptions,
+        containerPort: Number(args['compose-port'] || 8765),
+      });
+    } catch (error) {
+      overlayPublishedBindingError = error;
+    }
+  }
+  if (args['require-container-hardening']) {
+    try {
+      controlSecurity = await inspectDockerComposeControlSecurity(composeOptions);
+    } catch (error) {
+      controlSecurityError = error;
+    }
+  }
+  const report = await runDeploymentCheck({
+    publicControlUrl,
+    backendControlUrl,
+    requireHttps: Boolean(args['require-https']),
+    requireProxyAuthentication: Boolean(args['require-proxy-auth'] || args['require-proxy-authentication']),
+    requireContainerHardening: Boolean(args['require-container-hardening']),
+    overlayKind: args.overlay || null,
+    overlayInterface: args['overlay-interface'] || null,
+    overlayPublishedBindings,
+    overlayPublishedBindingError,
+    controlSecurity,
+    controlSecurityError,
+    timeoutMs: Number(args.timeout || 15_000),
+    publicClient: new NadoClient({ controlUrl: publicControlUrl, token }),
+    backendClient: backendControlUrl ? new NadoClient({ controlUrl: backendControlUrl, token }) : null,
+  });
+  const output = args.out ? await writeNewPrivateJson(args.out, report) : null;
+  if (args.json) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(`deploymentCheck=${report.ok ? 'passed' : 'failed'}`);
+    console.log(`publicControl=${report.publicControlUrl}`);
+    console.log(`backendControl=${report.backendControlUrl || '-'}`);
+    printTable(report.checks, [
+      { header: 'check', value: (check) => check.key },
+      { header: 'status', value: (check) => check.status },
+      { header: 'summary', value: (check) => check.summary },
+    ]);
+    for (const item of report.nextActions) {
+      console.log(`nextAction=${item.key}: ${item.action}`);
+    }
+    if (output) {
+      console.log(`report=${output}`);
+    }
+  }
+  if (!report.ok) {
+    process.exitCode = 2;
+  }
 }
 
 async function commandDoctor(args) {
@@ -1244,7 +2445,8 @@ async function commandSubmit(args) {
   const command = args.command;
   const prompt = args.prompt;
   const type = args.type || (prompt && !command ? 'agent' : 'shell');
-  const { task } = await client.createTask({
+  const localInputFiles = await buildInputFiles({ files: args.file, dirs: args.dir });
+  const created = await client.createTask({
     title: args.title || command || prompt,
     type,
     command,
@@ -1255,22 +2457,32 @@ async function commandSubmit(args) {
     requiredCapabilities: valueList(args.capability || args.capabilities),
     requiredTools: parseTools(args.tool || args.tools || args['required-tool'] || args['required-tools']),
     requiredLabels: parseLabels(args['required-label'] || args['required-labels']),
+    requiredResources: resourceRequirementsFromArgs(args),
     slots: parseSlots(args.slots || args['task-slots']),
     env: parseEnv(args.env),
     sandboxProfile: sandboxProfileFromArgs(args),
     artifactPolicy: artifactPolicyFromArgs(args),
     dependencyArtifacts: dependencyArtifactsFromArgs(args),
     requireRoutable: Boolean(args['require-routable'] || args.requireRoutable),
-    inputFiles: await buildInputFiles({ files: args.file, dirs: args.dir }),
+    inputFiles: localInputFiles.map(submittedInputFile),
     keepWorkspace: args['cleanup-workspace'] ? false : args['keep-workspace'] ? true : undefined,
     timeoutMs: args.timeout ? Number(args.timeout) : undefined,
+    maxAttempts: args['max-attempts'] ? Number(args['max-attempts']) : undefined,
+    retryPolicy: retryPolicyFromArgs(args),
+    retryBackoffMs: args['retry-backoff-ms'] ? Number(args['retry-backoff-ms']) : undefined,
+    maxRetryBackoffMs: args['max-retry-backoff-ms'] ? Number(args['max-retry-backoff-ms']) : undefined,
+    idempotencyKey: args['idempotency-key'] || undefined,
   });
+  const task = await uploadLocalTaskInputs(client, created.task, localInputFiles);
   console.log(`submitted ${task.id}`);
   console.log(`status=${task.status}`);
   console.log(`requestedWorker=${task.requestedWorkerId || '-'}`);
   console.log(`session=${task.sessionId || '-'}`);
   console.log(`priority=${task.priority || 0}`);
   console.log(`slots=${task.slots || 1}`);
+  console.log(`attempts=${task.attemptSeq || 0}/${task.maxAttempts || 3}`);
+  console.log(`retryPolicy=${JSON.stringify(task.retryPolicy || { failureKinds: [], exitCodes: [] })}`);
+  console.log(`idempotencyKey=${task.idempotencyKey || '-'}`);
   console.log(`inputFiles=${task.inputFiles?.map((file) => file.path).join(',') || '-'}`);
   console.log(`keepWorkspace=${task.keepWorkspace === undefined ? 'worker-default' : task.keepWorkspace}`);
   console.log(`env=${Object.keys(task.env || {}).join(',') || '-'}`);
@@ -1280,6 +2492,7 @@ async function commandSubmit(args) {
   console.log(`requiredCapabilities=${task.requiredCapabilities.join(',') || '-'}`);
   console.log(`requiredTools=${task.requiredTools?.join(',') || '-'}`);
   console.log(`requiredLabels=${formatLabels(task.requiredLabels)}`);
+  console.log(`requiredResources=${JSON.stringify(task.requiredResources || {})}`);
   printSchedulerSummary(task.scheduler);
 
   const shouldWait = Boolean(args.wait || args.watch || args.download);
@@ -1345,11 +2558,29 @@ async function commandBatchSubmit(args) {
   const file = requireValue(args.file, 'Batch submit requires --file');
   const { spec, batchFile } = await loadBatchSpec(file);
   const materialized = await materializeBatchInputs(spec, batchFile);
+  const localInputsByKey = new Map();
+  const submitted = {
+    ...materialized,
+    tasks: materialized.tasks.map((task, index) => {
+      const key = String(task.key || task.id || `task_${index + 1}`);
+      const localFiles = (task.inputFiles || []).filter((file) => file.localPath);
+      localInputsByKey.set(key, localFiles);
+      return {
+        ...task,
+        inputFiles: (task.inputFiles || []).map(submittedInputFile),
+      };
+    }),
+  };
   if (args['require-routable'] || args.requireRoutable) {
-    materialized.requireRoutable = true;
+    submitted.requireRoutable = true;
   }
   const client = makeClient(args);
-  const { batch, tasks } = await client.createBatch(materialized);
+  const created = await client.createBatch(submitted);
+  const batch = created.batch;
+  const tasks = [];
+  for (const task of created.tasks) {
+    tasks.push(await uploadLocalTaskInputs(client, task, localInputsByKey.get(task.batchKey) || []));
+  }
   console.log(`batch=${batch.id}`);
   console.log(`title=${batch.title}`);
   console.log(`tasks=${tasks.length}`);
@@ -1711,6 +2942,9 @@ async function commandBatchManage(args) {
   if (args['required-label'] !== undefined || args['required-labels'] !== undefined) {
     options.requiredLabels = parseLabels(args['required-label'] || args['required-labels']);
   }
+  if (resourceRequirementsFromArgs(args)) {
+    options.requiredResources = resourceRequirementsFromArgs(args);
+  }
   const result = await client.manageBatch(batchId, action, options);
   console.log(`batch=${result.batch.id}`);
   console.log(`status=${result.batch.status}`);
@@ -1733,6 +2967,7 @@ async function commandSessionCreate(args) {
     requiredCapabilities: valueList(args.capability || args.capabilities),
     requiredTools: parseTools(args.tool || args.tools || args['required-tool'] || args['required-tools']),
     requiredLabels: parseLabels(args['required-label'] || args['required-labels']),
+    requiredResources: resourceRequirementsFromArgs(args),
     labels: parseLabels(args.label),
   });
   console.log(`created ${session.id}`);
@@ -1741,6 +2976,7 @@ async function commandSessionCreate(args) {
   console.log(`requiredCapabilities=${session.requiredCapabilities.join(',') || '-'}`);
   console.log(`requiredTools=${session.requiredTools?.join(',') || '-'}`);
   console.log(`requiredLabels=${formatLabels(session.requiredLabels)}`);
+  console.log(`requiredResources=${JSON.stringify(session.requiredResources || {})}`);
 }
 
 async function commandSessions(args) {
@@ -1815,6 +3051,7 @@ async function commandTasks(args) {
   printTable(tasks, [
     { header: 'id', value: (task) => task.id },
     { header: 'status', value: (task) => task.status },
+    { header: 'runtime', value: (task) => task.runtimeDiagnostics?.state || '-' },
     { header: 'prio', value: (task) => task.priority || 0 },
     { header: 'worker', value: (task) => task.assignedWorkerId || task.requestedWorkerId || '-' },
     { header: 'session', value: (task) => task.sessionId || '-' },
@@ -1883,7 +3120,7 @@ function taskWaitDiagnosticLines(task) {
   if (lastEvent) {
     lines.push(`lastEvent=${lastEvent.type || '-'} ${String(lastEvent.message || '').replace(/\s+/g, ' ').slice(0, 160)}`);
   }
-  const actionHint = routingActionHint(task);
+  const actionHint = task.runtimeDiagnostics?.nextAction || routingActionHint(task);
   if (actionHint) {
     lines.push(`nextAction=${actionHint.code}`);
     lines.push(`nextActionMessage=${actionHint.message}`);
@@ -1946,7 +3183,9 @@ async function commandRecover(args) {
     printTable(candidates, [
       { header: 'task', value: (item) => item.task.id },
       { header: 'worker', value: (item) => item.task.assignedWorkerId || '-' },
+      { header: 'reason', value: (item) => item.recoveryReason || 'worker_offline' },
       { header: 'offlineMs', value: (item) => item.offlineMs ?? '-' },
+      { header: 'leaseExpiredMs', value: (item) => item.leaseExpiredMs ?? '-' },
       { header: 'session', value: (item) => item.task.sessionId || '-' },
       { header: 'title', value: (item) => item.task.title.slice(0, 48) },
     ]);
@@ -1973,9 +3212,13 @@ async function commandRecover(args) {
   });
   console.log(`candidates=${result.candidates.length}`);
   console.log(`recovered=${result.recovered.length}`);
+  console.log(`exhausted=${result.exhausted?.length || 0}`);
   console.log(`skipped=${result.skipped.length}`);
   for (const task of result.recovered) {
-    console.log(`- recovered ${task.id} requestedWorker=${task.requestedWorkerId || '-'} status=${task.status}`);
+    console.log(`- recovered ${task.id} requestedWorker=${task.requestedWorkerId || '-'} status=${task.status} notBefore=${task.notBeforeAt || '-'}`);
+  }
+  for (const task of result.exhausted || []) {
+    console.log(`- exhausted ${task.id}: ${task.error}`);
   }
   for (const skipped of result.skipped) {
     console.log(`- skipped ${skipped.task.id}: ${skipped.reason}`);
@@ -2007,6 +3250,9 @@ async function commandTaskManage(args) {
   if (args['required-label'] !== undefined || args['required-labels'] !== undefined) {
     options.requiredLabels = parseLabels(args['required-label'] || args['required-labels']);
   }
+  if (resourceRequirementsFromArgs(args)) {
+    options.requiredResources = resourceRequirementsFromArgs(args);
+  }
   const { task } = await client.manageTask(taskId, action, options);
   console.log(`task=${task.id}`);
   console.log(`status=${task.status}`);
@@ -2014,6 +3260,7 @@ async function commandTaskManage(args) {
   console.log(`slots=${task.slots || 1}`);
   console.log(`requiredTools=${task.requiredTools?.join(',') || '-'}`);
   console.log(`requiredLabels=${formatLabels(task.requiredLabels)}`);
+  console.log(`requiredResources=${JSON.stringify(task.requiredResources || {})}`);
   if (task.scheduler) {
     console.log(`scheduler=${task.scheduler.reason}`);
   }
@@ -2457,12 +3704,28 @@ async function main(argv = process.argv.slice(2)) {
     await commandControlStart(args);
     return;
   }
+  if (command === 'store' && subcommand === 'backup') {
+    await commandStoreBackup(args);
+    return;
+  }
+  if (command === 'store' && subcommand === 'verify') {
+    await commandStoreVerify(args);
+    return;
+  }
+  if (command === 'store' && subcommand === 'restore') {
+    await commandStoreRestore(args);
+    return;
+  }
   if (command === 'worker' && subcommand === 'start') {
     await commandWorkerStart(args);
     return;
   }
   if (command === 'worker' && subcommand === 'bootstrap-start') {
     await commandWorkerBootstrapStart(args);
+    return;
+  }
+  if (command === 'worker' && subcommand === 'inspect') {
+    await commandWorkerInspect(args);
     return;
   }
   if (command === 'worker' && subcommand === 'preflight') {
@@ -2501,6 +3764,10 @@ async function main(argv = process.argv.slice(2)) {
     await commandWorkerTokenCreate(args);
     return;
   }
+  if (command === 'worker' && subcommand === 'token' && args._[2] === 'rotate') {
+    await commandWorkerTokenRotate(args);
+    return;
+  }
   if (command === 'worker' && subcommand === 'token' && args._[2] === 'revoke') {
     await commandWorkerTokenRevoke(args);
     return;
@@ -2519,6 +3786,38 @@ async function main(argv = process.argv.slice(2)) {
   }
   if (command === 'status') {
     await commandStatus(args);
+    return;
+  }
+  if (command === 'audit') {
+    await commandAudit(args);
+    return;
+  }
+  if (command === 'acceptance' && subcommand === 'template') {
+    await commandAcceptanceTemplate(args);
+    return;
+  }
+  if (command === 'acceptance' && subcommand === 'runbook') {
+    await commandAcceptanceRunbook(args);
+    return;
+  }
+  if (command === 'acceptance' && subcommand === 'evidence' && args._[2] === 'init') {
+    await commandAcceptanceEvidenceInit(args);
+    return;
+  }
+  if (command === 'acceptance' && subcommand === 'evidence' && args._[2] === 'record') {
+    await commandAcceptanceEvidenceRecord(args);
+    return;
+  }
+  if (command === 'acceptance' && subcommand === 'exercise') {
+    await commandAcceptanceExercise(args);
+    return;
+  }
+  if (command === 'acceptance') {
+    await commandAcceptance(args);
+    return;
+  }
+  if (command === 'deployment' && subcommand === 'check') {
+    await commandDeploymentCheck(args);
     return;
   }
   if (command === 'network') {
@@ -2698,12 +3997,18 @@ function cliErrorHints(error) {
     hints.push('hint=Also verify the bundle Control URL is reachable from the worker host and is not a 127.0.0.1/localhost URL from the control machine.');
   }
   if (path.includes('/api/workers/') && path.endsWith('/preflight')) {
+    if (status === 401 && error.details?.code === 'worker_clock_skew') {
+      hints.push(`hint=Worker clock differs from Control by ${error.details.clockSkewMs ?? 'unknown'}ms; allowed=${error.details.maxClockSkewMs ?? 'unknown'}ms. Synchronize NTP/Windows Time on both hosts, then retry preflight.`);
+    }
     if (status === 401 && /Signed worker request headers are required|signature/i.test(responseError || message)) {
       hints.push('hint=Worker preflight needs the signed identity created during self-service enrollment. Keep the generated `.nado/worker-identity.json`, or download a fresh self-service bundle if the identity was deleted or copied from another host.');
     }
     if (status === 403 && /not valid for worker/i.test(responseError || message)) {
       hints.push('hint=Worker token and worker ID do not match. Use the worker ID stored in `.nado/worker-identity.json`, or generate a new invite/bundle for this worker.');
     }
+  }
+  if (error.code === 'NADO_WORKER_CLOCK_SKEW') {
+    hints.push('hint=Synchronize the VM with chrony/systemd-timesyncd and the home host with NTP or Windows Time, then rerun `nado worker preflight`.');
   }
   if (/fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN/i.test(message)) {
     hints.push('hint=Control URL is not reachable from this process. Check `--control`, DNS, firewall/VPN, IPv6 brackets, and NADO_PUBLIC_CONTROL_URL before retrying.');

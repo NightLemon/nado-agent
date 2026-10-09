@@ -13,9 +13,17 @@ write_files:
     content: |
       NADO_TOKEN=replace-with-a-long-random-admin-token
       NADO_PUBLIC_CONTROL_URL=https://nado.example.com
+      NADO_DOMAIN=nado.example.com
+      NADO_TRUST_PROXY=true
+      NADO_TRUST_PROXY_SECRET=replace-with-a-distinct-random-proxy-secret
       NADO_DOCKER_PORT=8765
       NADO_STORE=sqlite
-      NADO_DOCKER_HOST_IP=0.0.0.0
+      NADO_DOCKER_HOST_IP=127.0.0.1
+      NADO_EDGE_HOST_IP=0.0.0.0
+      NADO_HTTP_PORT=80
+      NADO_HTTPS_PORT=443
+      NADO_AUDIT_NDJSON_FILE=/data/audit/nado-audit.ndjson
+      NADO_AUDIT_NDJSON_MAX_PENDING=1024
 
 runcmd:
   - install -m 0755 -d /etc/apt/keyrings
@@ -25,4 +33,4 @@ runcmd:
   - apt-get update
   - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   - systemctl enable --now docker
-  - echo "Clone the repository into /opt/nado-agent, copy .env.example to .env, set real values, then run docker compose -f docker-compose.azure.yml up -d --build" > /opt/nado-agent/README-next-steps.txt
+  - echo "Clone the repository into /opt/nado-agent, copy .env.example to .env, set real values, point DNS at this VM, then run docker compose -f docker-compose.azure.yml -f docker-compose.azure-https.yml up -d --build" > /opt/nado-agent/README-next-steps.txt

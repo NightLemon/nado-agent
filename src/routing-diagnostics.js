@@ -38,6 +38,14 @@ export function routingActionHint(task = {}) {
   const candidateReasons = (task.scheduler?.candidates || [])
     .flatMap((candidate) => candidate.reasons || [])
     .filter(Boolean);
+  if (candidateReasons.some((item) => String(item).startsWith('protocol mismatch:'))) {
+    return {
+      code: 'upgrade_incompatible_worker',
+      message: 'The selected or available Worker uses an incompatible Nado protocol. Deploy Control and Worker from the same release, restart the Worker, and wait for a fresh heartbeat.',
+      cli: 'nado workers --control <control-url> then create and install a fresh worker bootstrap bundle from this Control release',
+      mcp: ['nado_list_workers', 'nado_create_worker_bootstrap_bundle', 'nado_list_worker_events'],
+    };
+  }
   if (reason === 'no eligible worker') {
     if (candidateReasons.some((item) => String(item).includes('capacity full'))) {
       return {

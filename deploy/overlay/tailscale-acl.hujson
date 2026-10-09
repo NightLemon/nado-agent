@@ -1,0 +1,24 @@
+{
+  // Merge these owners and ACLs into the existing Tailnet policy. Issue the
+  // control and worker machines different tagged auth keys.
+  "tagOwners": {
+    "tag:nado-control": ["autogroup:admin"],
+    "tag:nado-worker": ["autogroup:admin"],
+  },
+
+  "acls": [
+    // Workers need only the Nado Control API. No worker-to-worker rule exists.
+    {
+      "action": "accept",
+      "src": ["tag:nado-worker"],
+      "dst": ["tag:nado-control:8765"],
+    },
+    // Tailnet administrators may operate the Control API and Dashboard.
+    {
+      "action": "accept",
+      "src": ["autogroup:admin"],
+      "dst": ["tag:nado-control:8765"],
+    },
+  ],
+}
+

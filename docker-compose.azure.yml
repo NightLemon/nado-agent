@@ -1,7 +1,9 @@
 services:
   control:
-    build: .
-    image: nado-agent:azure
+    build:
+      context: .
+      target: control
+    image: nado-agent-control:azure
     command:
       - control
       - start
@@ -14,7 +16,7 @@ services:
     ports:
       - target: 8765
         published: "${NADO_DOCKER_PORT:-8765}"
-        host_ip: "${NADO_DOCKER_HOST_IP:-0.0.0.0}"
+        host_ip: "${NADO_DOCKER_HOST_IP:-127.0.0.1}"
         protocol: tcp
     environment:
       NADO_TOKEN: ${NADO_TOKEN:?Set NADO_TOKEN in .env}
@@ -22,8 +24,36 @@ services:
       NADO_STORE: ${NADO_STORE:-sqlite}
       NADO_INTERNAL_CONTROL_URL: http://127.0.0.1:8765
       NADO_PUBLIC_CONTROL_URL: ${NADO_PUBLIC_CONTROL_URL:?Set NADO_PUBLIC_CONTROL_URL in .env}
+      NADO_TRUST_PROXY: ${NADO_TRUST_PROXY:-false}
+      NADO_TRUST_PROXY_SECRET: ${NADO_TRUST_PROXY_SECRET:-}
+      NADO_AUTO_RECOVER_OFFLINE_MS: ${NADO_AUTO_RECOVER_OFFLINE_MS:-0}
+      NADO_TASK_LEASE_MS: ${NADO_TASK_LEASE_MS:-60000}
+      NADO_CONTROL_DATA_LEASE_TIMEOUT_MS: ${NADO_CONTROL_DATA_LEASE_TIMEOUT_MS:-60000}
+      NADO_CONTROL_DATA_LEASE_HEARTBEAT_MS: ${NADO_CONTROL_DATA_LEASE_HEARTBEAT_MS:-10000}
+      NADO_NETWORK_PROBE_MIN_INTERVAL_MS: ${NADO_NETWORK_PROBE_MIN_INTERVAL_MS:-30000}
+      NADO_JSON_BODY_MAX_BYTES: ${NADO_JSON_BODY_MAX_BYTES:-67108864}
+      NADO_RATE_LIMIT_WINDOW_MS: ${NADO_RATE_LIMIT_WINDOW_MS:-60000}
+      NADO_RATE_LIMIT_IP: ${NADO_RATE_LIMIT_IP:-1800}
+      NADO_RATE_LIMIT_ADMIN: ${NADO_RATE_LIMIT_ADMIN:-600}
+      NADO_RATE_LIMIT_WORKER: ${NADO_RATE_LIMIT_WORKER:-1800}
+      NADO_RATE_LIMIT_ENROLLMENT: ${NADO_RATE_LIMIT_ENROLLMENT:-60}
+      NADO_AUDIT_NDJSON_FILE: ${NADO_AUDIT_NDJSON_FILE:-}
+      NADO_AUDIT_NDJSON_MAX_PENDING: ${NADO_AUDIT_NDJSON_MAX_PENDING:-1024}
     volumes:
       - nado-control-data:/data/control
+      - nado-control-audit:/data/audit
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=67108864,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETPCAP
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8765/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
@@ -33,3 +63,4 @@ services:
 
 volumes:
   nado-control-data:
+  nado-control-audit:

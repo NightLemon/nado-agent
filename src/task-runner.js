@@ -7,15 +7,67 @@ import { collectArtifacts } from './artifacts.js';
 
 function shellCommand(command) {
   if (process.platform === 'win32') {
+    const preserveNativeExitCode = `& {
+${command}
+}
+$nadoCommandSucceeded = $?
+$nadoCommandExitCode = $LASTEXITCODE
+if ($null -ne $nadoCommandExitCode) { exit $nadoCommandExitCode }
+if (-not $nadoCommandSucceeded) { exit 1 }`;
     return {
       file: 'powershell.exe',
-      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', preserveNativeExitCode],
     };
   }
   return {
     file: '/bin/bash',
     args: ['-lc', command],
   };
+}
+
+function terminateProcessTree(child, force = false) {
+  if (!child?.pid) {
+    return;
+  }
+  if (process.platform === 'win32') {
+    const script = [
+      'function Stop-NadoProcessTree([int]$TargetId) {',
+      '  @(Get-CimInstance Win32_Process -Filter ("ParentProcessId=" + $TargetId) -ErrorAction SilentlyContinue) | ForEach-Object {',
+      '    Stop-NadoProcessTree ([int]$_.ProcessId)',
+      '  }',
+      '  Stop-Process -Id $TargetId -Force -ErrorAction SilentlyContinue',
+      '}',
+      `Stop-NadoProcessTree ${child.pid}`,
+    ].join('\n');
+    const killer = spawn('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy', 'Bypass',
+      '-Command', script,
+    ], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    killer.once('error', () => {
+      try {
+        child.kill(force ? 'SIGKILL' : 'SIGTERM');
+      } catch {
+        // The direct process may already have exited while the tree killer was starting.
+      }
+    });
+    return;
+  }
+  try {
+    process.kill(-child.pid, force ? 'SIGKILL' : 'SIGTERM');
+  } catch (error) {
+    if (error.code !== 'ESRCH') {
+      try {
+        child.kill(force ? 'SIGKILL' : 'SIGTERM');
+      } catch {
+        // The process may have exited between the group and direct signals.
+      }
+    }
+  }
 }
 
 function quoteForShell(value) {
@@ -147,7 +199,7 @@ ${result.error || '(none)'}
   await fs.appendFile(transcriptFile, entry, 'utf8');
 }
 
-async function writeInputFiles(workspace, inputFiles = []) {
+async function writeInputFiles(workspace, inputFiles = [], options = {}) {
   const root = path.resolve(workspace);
   for (const file of inputFiles) {
     const relativePath = String(file.path || '').replaceAll('\\', '/');
@@ -159,7 +211,14 @@ async function writeInputFiles(workspace, inputFiles = []) {
       throw new Error(`Unsafe input file path: ${file.path}`);
     }
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, Buffer.from(file.contentBase64 || '', 'base64'));
+    if (file.inputUploadId || file.sourceArtifactId) {
+      if (typeof options.downloadInput !== 'function') {
+        throw new Error(`No remote input downloader configured for: ${file.path}`);
+      }
+      await options.downloadInput(file, target);
+    } else {
+      await fs.writeFile(target, Buffer.from(file.contentBase64 || '', 'base64'));
+    }
   }
 }
 
@@ -170,13 +229,31 @@ function runProcess(command, { cwd, timeoutMs, maxOutputChars, env, signal, onOu
       cwd,
       env,
       windowsHide: true,
+      detached: process.platform !== 'win32',
     });
 
     let stdout = '';
     let stderr = '';
     let timedOut = false;
     let cancelled = false;
-    const pendingOutputEvents = [];
+    let closed = false;
+    let forceKillTimer = null;
+    const pendingOutputEvents = new Set();
+
+    const stopProcessTree = () => {
+      if (closed) {
+        return;
+      }
+      terminateProcessTree(child, false);
+      if (process.platform !== 'win32' && !forceKillTimer) {
+        forceKillTimer = setTimeout(() => {
+          if (!closed) {
+            terminateProcessTree(child, true);
+          }
+        }, 2_000);
+        forceKillTimer.unref();
+      }
+    };
 
     const emitOutput = (stream, text) => {
       if (!onOutput || !text) {
@@ -184,29 +261,22 @@ function runProcess(command, { cwd, timeoutMs, maxOutputChars, env, signal, onOu
       }
       const maybePromise = onOutput(stream, text);
       if (maybePromise?.then) {
-        pendingOutputEvents.push(maybePromise.catch(() => {}));
+        const pending = Promise.resolve(maybePromise)
+          .catch(() => {})
+          .finally(() => pendingOutputEvents.delete(pending));
+        pendingOutputEvents.add(pending);
       }
     };
 
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        if (!child.killed) {
-          child.kill('SIGKILL');
-        }
-      }, 2_000).unref();
+      stopProcessTree();
     }, timeoutMs);
     timeout.unref();
 
     const abort = () => {
       cancelled = true;
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        if (!child.killed) {
-          child.kill('SIGKILL');
-        }
-      }, 2_000).unref();
+      stopProcessTree();
     };
 
     if (signal) {
@@ -229,22 +299,27 @@ function runProcess(command, { cwd, timeoutMs, maxOutputChars, env, signal, onOu
     });
 
     child.on('error', async (error) => {
+      closed = true;
       clearTimeout(timeout);
+      clearTimeout(forceKillTimer);
       signal?.removeEventListener?.('abort', abort);
-      await Promise.allSettled(pendingOutputEvents);
+      await Promise.allSettled([...pendingOutputEvents]);
       resolve({
         exitCode: 1,
         stdout,
         stderr,
         error: error.message,
         timedOut,
+        failureKind: 'process_error',
       });
     });
 
     child.on('close', async (code, terminationSignal) => {
+      closed = true;
       clearTimeout(timeout);
+      clearTimeout(forceKillTimer);
       signal?.removeEventListener?.('abort', abort);
-      await Promise.allSettled(pendingOutputEvents);
+      await Promise.allSettled([...pendingOutputEvents]);
       const timeoutMessage = timedOut ? `Timed out after ${timeoutMs}ms` : null;
       const cancelMessage = cancelled ? 'Cancelled by gateway management command' : null;
       resolve({
@@ -254,6 +329,13 @@ function runProcess(command, { cwd, timeoutMs, maxOutputChars, env, signal, onOu
         error: timeoutMessage || cancelMessage || (terminationSignal ? `Terminated by ${terminationSignal}` : null),
         timedOut,
         cancelled,
+        failureKind: timedOut
+          ? 'timeout'
+          : cancelled
+            ? 'cancelled'
+            : code === 0
+              ? null
+              : 'nonzero_exit',
       });
     });
   });
@@ -268,7 +350,7 @@ export async function runTask(task, options) {
   await writeInputFiles(workspace, [
     ...(task.inputFiles || []),
     ...(task.dependencyInputFiles || []),
-  ]);
+  ], options);
   const shouldCleanupWorkspace = !task.sessionId && (
     task.keepWorkspace === false
     || (task.keepWorkspace === undefined && options.cleanupWorkspaces)
@@ -280,7 +362,8 @@ export async function runTask(task, options) {
       artifactPolicy: task.artifactPolicy,
     }) : [];
     let workspaceCleaned = false;
-    if (shouldCleanupWorkspace) {
+    const needsDeferredArtifactUpload = artifacts.some((artifact) => artifact.localPath && !artifact.skipped);
+    if (shouldCleanupWorkspace && !needsDeferredArtifactUpload) {
       await fs.rm(workspace, { recursive: true, force: true });
       workspaceCleaned = true;
     }
@@ -288,6 +371,7 @@ export async function runTask(task, options) {
       ...result,
       workspace,
       workspaceCleaned,
+      cleanupWorkspaceAfterUpload: shouldCleanupWorkspace && needsDeferredArtifactUpload,
       artifacts,
     };
   };
@@ -306,6 +390,7 @@ export async function runTask(task, options) {
         stdout: '',
         stderr: '',
         error: 'Worker has no agent command configured',
+        failureKind: 'configuration_error',
       });
     }
     const prompt = task.prompt || task.command || '';
@@ -329,6 +414,7 @@ export async function runTask(task, options) {
       stdout: '',
       stderr: '',
       error: `Task type ${task.type} requires a command`,
+      failureKind: 'configuration_error',
     });
   }
 
@@ -338,11 +424,15 @@ export async function runTask(task, options) {
     maxOutputChars,
     env: processEnvForTask(task.env || {}, {
       NADO_TASK_ID: task.id,
+      NADO_ATTEMPT_ID: task.currentAttemptId || '',
+      NADO_ATTEMPT_SEQ: String(task.attemptSeq || ''),
       NADO_BATCH_ID: task.batchId || '',
       NADO_BATCH_KEY: task.batchKey || '',
       NADO_BATCH_DEPENDS_ON: (task.dependencyKeys || []).join(','),
       NADO_SESSION_ID: task.sessionId || '',
       NADO_WORKER_ID: options.workerId,
+      NADO_WORKER_RUNTIME_ID: options.workerRuntimeId || '',
+      NADO_WORKER_RUNTIME_STARTED_AT: options.workerRuntimeStartedAt || '',
       NADO_WORKSPACE: workspace,
       NADO_AGENT_TRANSCRIPT: transcriptFile || '',
       NADO_HOSTNAME: os.hostname(),
@@ -367,5 +457,6 @@ export async function runTask(task, options) {
     stdout: result.stdout,
     stderr: result.stderr,
     error: result.error,
+    failureKind: result.failureKind,
   });
 }

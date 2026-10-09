@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -292,6 +293,18 @@ test('self-service worker enrollment assigns identity and starts the normal work
   const admin = new NadoClient({ controlUrl, token: adminToken });
 
   try {
+    await admin.registerWorker({
+      id: 'admin-auth-worker',
+      capabilities: ['code'],
+      identity: {
+        type: 'worker_token', scoped: true, signed: true, signatureAlgorithm: 'ed25519',
+      },
+    });
+    const adminAuthenticated = await admin.getWorker('admin-auth-worker');
+    assert.equal(adminAuthenticated.worker.identity.type, 'admin');
+    assert.equal(adminAuthenticated.worker.identity.scoped, false);
+    assert.equal(adminAuthenticated.worker.identity.signed, false);
+
     const issued = await admin.createWorkerEnrollmentToken({
       label: 'lab bootstrap',
       maxUses: 2,
@@ -331,6 +344,7 @@ test('self-service worker enrollment assigns identity and starts the normal work
       workerData,
       '--capability',
       'code',
+      '--strict-local-readiness',
       '--poll-ms',
       '50',
       '--once',
@@ -338,6 +352,11 @@ test('self-service worker enrollment assigns identity and starts the normal work
     assert.match(firstStart, /enrollment=created/);
     assert.match(firstStart, /worker=worker-/);
     assert.match(firstStart, /preflight=ok/);
+    assert.match(firstStart, /clock=passed/);
+    assert.match(firstStart, /clockOffsetMs=-?\d+/);
+    assert.match(firstStart, /localReadiness=ok phase=pre-enrollment/);
+    assert.match(firstStart, /localReadiness=ok phase=post-preflight/);
+    assert.match(firstStart, /localReadinessCheck=workerIdentity status=passed/);
     assert.match(firstStart, /auth=worker/);
     assert.match(firstStart, /registered .*code/);
     const workerId = firstStart.match(/worker=(worker-[^\r\n]+)/)?.[1];
@@ -368,6 +387,21 @@ test('self-service worker enrollment assigns identity and starts the normal work
     });
     const signedPreflight = await signedWorkerClient.workerPreflight(workerId);
     assert.equal(signedPreflight.auth, 'worker');
+    const skewedWorkerClient = new NadoClient({
+      controlUrl,
+      token: identity.workerToken,
+      workerId,
+      privateKeyPem: identity.privateKeyPem,
+      now: () => Date.now() + (10 * 60_000),
+    });
+    await assert.rejects(
+      () => skewedWorkerClient.workerPreflight(workerId),
+      (error) => (
+        error.status === 401
+        && error.details?.code === 'worker_clock_skew'
+        && Math.abs(error.details.clockSkewMs) > error.details.maxClockSkewMs
+      ),
+    );
     const replayPath = `/api/workers/${encodeURIComponent(workerId)}/preflight`;
     const replayHeaders = {
       accept: 'application/json',
@@ -404,6 +438,19 @@ test('self-service worker enrollment assigns identity and starts the normal work
       body: heartbeatBody,
     });
     assert.equal(untamperedHeartbeat.status, 200);
+    const authenticatedWorker = await admin.getWorker(workerId);
+    assert.equal(authenticatedWorker.worker.identity.type, 'worker_token');
+    assert.equal(authenticatedWorker.worker.identity.scoped, true);
+    assert.equal(authenticatedWorker.worker.identity.signed, true);
+    assert.equal(authenticatedWorker.worker.identity.workerTokenId, identity.workerTokenId);
+    assert.equal(authenticatedWorker.worker.identity.signatureAlgorithm, 'ed25519');
+    assert.ok(Date.parse(authenticatedWorker.worker.identity.signatureSignedAt));
+    assert.ok(Math.abs(authenticatedWorker.worker.identity.signatureClockSkewMs) < 5_000);
+    assert.equal(authenticatedWorker.worker.identity.signatureMaxClockSkewMs, 300_000);
+    assert.ok(authenticatedWorker.worker.identity.observedAt);
+    assert.match(authenticatedWorker.worker.connection.remoteAddress, /127\.0\.0\.1/);
+    assert.equal(authenticatedWorker.worker.connection.addressSource, 'socket');
+    assert.equal(authenticatedWorker.worker.connection.protocol, 'http');
     const enrollmentTokens = await admin.listWorkerEnrollmentTokens();
     const used = enrollmentTokens.enrollmentTokens.find((token) => token.id === issued.enrollmentToken.id);
     assert.equal(used.useCount, 1);
@@ -426,6 +473,16 @@ test('self-service worker enrollment assigns identity and starts the normal work
     assert.match(secondStart, /auth=worker/);
 
     await admin.revokeWorkerToken(identity.workerTokenId);
+    const replacementPublicKey = crypto.generateKeyPairSync('ed25519').publicKey.export({
+      type: 'spki',
+      format: 'pem',
+    });
+    identity.publicKeyPem = replacementPublicKey;
+    await fs.writeFile(
+      path.join(workerData, 'worker-identity.json'),
+      `${JSON.stringify(identity, null, 2)}\n`,
+      'utf8',
+    );
     const recoveryToken = await admin.createWorkerEnrollmentToken({
       label: 'recover bootstrap identity',
       maxUses: 1,
@@ -443,16 +500,15 @@ test('self-service worker enrollment assigns identity and starts the normal work
       '50',
       '--once',
     ], {});
-    assert.match(recoveredStart, /enrollment=reused/);
-    assert.match(recoveredStart, /preflight=recovering/);
-    assert.match(recoveredStart, /recovery=reenroll/);
-    assert.match(recoveredStart, /enrollment=recovered/);
+    assert.match(recoveredStart, /enrollment=created/);
+    assert.doesNotMatch(recoveredStart, /preflight=recovering/);
     assert.match(recoveredStart, new RegExp(`worker=${workerId}`));
     assert.match(recoveredStart, /preflight=ok/);
     assert.match(recoveredStart, /auth=worker/);
     const recoveredIdentity = JSON.parse(await fs.readFile(path.join(workerData, 'worker-identity.json'), 'utf8'));
     assert.equal(recoveredIdentity.workerId, workerId);
     assert.notEqual(recoveredIdentity.workerTokenId, identity.workerTokenId);
+    assert.notEqual(recoveredIdentity.publicKeyPem, replacementPublicKey);
 
     const bundle = await admin.downloadWorkerBootstrapBundle({
       issueEnrollmentToken: true,

@@ -1,0 +1,10 @@
+{$NADO_DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy control:8765 {
+		header_up X-Nado-Proxy-Secret {$NADO_TRUST_PROXY_SECRET}
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-For {remote_host}
+	}
+}

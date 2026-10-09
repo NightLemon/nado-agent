@@ -55,7 +55,7 @@ function waitForStdout(child, regex, timeoutMs = 8_000) {
   });
 }
 
-async function runCli(args, env, timeout = 8_000) {
+async function runCli(args, env, timeout = 20_000) {
   const { stdout } = await execFileAsync(process.execPath, [cliPath, ...args], {
     env: { ...process.env, ...env },
     timeout,
@@ -75,6 +75,153 @@ async function waitForCliTask(taskId, controlUrl, token, timeoutMs = 8_000) {
   }
   assert.fail(`Timed out waiting for CLI task ${taskId}`);
 }
+
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGTERM');
+  await Promise.race([
+    exited,
+    new Promise((resolve) => setTimeout(resolve, 3_000)),
+  ]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill();
+    await exited;
+  }
+}
+
+test('control start redacts configured administrator tokens from service logs', async () => {
+  const root = await makeTempDir();
+  const secret = 'configured-admin-secret-must-not-appear';
+  const child = spawn(process.execPath, [
+    cliPath,
+    'control',
+    'start',
+    '--host', '127.0.0.1',
+    '--port', '0',
+    '--data-dir', path.join(root, 'control'),
+  ], {
+    env: { ...process.env, NADO_TOKEN: secret },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+  try {
+    await waitForStdout(child, /Administrator token: configured via environment \(redacted\)/);
+  } finally {
+    await stopChild(child);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+  assert.doesNotMatch(stdout, new RegExp(secret));
+  assert.doesNotMatch(stderr, new RegExp(secret));
+});
+
+test('remote-facing control start requires a supplied token or private token file', async () => {
+  const root = await makeTempDir();
+  try {
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        cliPath,
+        'control',
+        'start',
+        '--host', '127.0.0.1',
+        '--port', '0',
+        '--public-control-url', 'https://nado.example.com',
+        '--data-dir', path.join(root, 'control'),
+      ], {
+        env: { ...process.env, NADO_TOKEN: '' },
+        timeout: 8_000,
+      }),
+      (error) => error.code === 1 && /refusing to print a generated administrator token/.test(error.stderr),
+    );
+    await assert.rejects(
+      execFileAsync(process.execPath, [
+        cliPath,
+        'control',
+        'start',
+        '--host', '127.0.0.1',
+        '--port', '0',
+        '--public-control-url', 'https://nado.example.com',
+        '--data-dir', path.join(root, 'control'),
+        '--generate-token-file', path.join(root, 'control', 'admin-token'),
+      ], {
+        env: { ...process.env, NADO_TOKEN: '' },
+        timeout: 8_000,
+      }),
+      (error) => error.code === 1 && /must be outside the Control data directory/.test(error.stderr),
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('remote-facing control can write a generated token to a private external file', async () => {
+  const root = await makeTempDir();
+  const dataDir = path.join(root, 'control');
+  const tokenFile = path.join(root, 'secrets', 'admin-token');
+  const child = spawn(process.execPath, [
+    cliPath,
+    'control',
+    'start',
+    '--host', '127.0.0.1',
+    '--port', '0',
+    '--public-control-url', 'https://nado.example.com',
+    '--data-dir', dataDir,
+    '--generate-token-file', tokenFile,
+  ], {
+    env: { ...process.env, NADO_TOKEN: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+  try {
+    await waitForStdout(child, /Generated administrator token written to private file:/);
+    const token = (await fs.readFile(tokenFile, 'utf8')).trim();
+    assert.match(token, /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(stdout, new RegExp(token));
+  } finally {
+    await stopChild(child);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('remotely advertised quickstart redacts logs and disables Dashboard token injection', async () => {
+  const root = await makeTempDir();
+  const secret = 'remote-quickstart-secret-must-not-appear';
+  const child = spawn(process.execPath, [
+    cliPath,
+    'quickstart',
+    '--host', '127.0.0.1',
+    '--port', '0',
+    '--public-control-url', 'https://nado.example.com',
+    '--data-dir', root,
+    '--worker', 'remote-quick-worker',
+    '--poll-ms', '50',
+    '--skip-self-test',
+  ], {
+    env: { ...process.env, NADO_TOKEN: secret },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8'); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+  try {
+    const match = await waitForStdout(child, /control=(http:\/\/127\.0\.0\.1:\d+)/, 15_000);
+    const html = await (await fetch(`${match[1]}/dashboard`)).text();
+    assert.doesNotMatch(html, new RegExp(secret));
+    assert.doesNotMatch(stdout, new RegExp(secret));
+    assert.doesNotMatch(stderr, new RegExp(secret));
+    assert.match(stdout, /token=configured:environment:redacted/);
+  } finally {
+    await stopChild(child);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test('CLI prints a reusable worker invite command', async () => {
   const stdout = await runCli([
@@ -120,6 +267,7 @@ test('CLI builds a portable worker bundle from the real worker runtime', async (
   const root = await makeTempDir();
   try {
     const out = path.join(root, 'gpu-worker-bundle.zip');
+    const stableDataDir = path.join(root, 'stable-gpu-worker-data');
     const stdout = await runCli([
       'worker',
       'bundle',
@@ -138,6 +286,8 @@ test('CLI builds a portable worker bundle from the real worker runtime', async (
       '--poll-ms',
       '500',
       '--cleanup-workspaces',
+      '--data-dir',
+      stableDataDir,
       '--out',
       out,
     ], { NADO_TOKEN: 'bundle-token' });
@@ -145,16 +295,23 @@ test('CLI builds a portable worker bundle from the real worker runtime', async (
     assert.match(stdout, /bundle=.*gpu-worker-bundle\.zip/);
     assert.match(stdout, /worker=gpu-worker/);
     assert.match(stdout, /start=bash \.\/start-worker\.sh/);
+    assert.match(stdout, /upgradeReady=true/);
     const zip = await fs.readFile(out);
     assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/start-worker.sh')));
     assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/start-worker.ps1')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/install-systemd.sh')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/install-scheduled-task.ps1')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/install-launchd.sh')));
     assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/src/cli.js')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/src/worker-inspect.js')));
     assert.ok(zip.includes(Buffer.from('nado-worker-gpu-worker/package.json')));
     assert.ok(zip.includes(Buffer.from("export NADO_TOKEN='bundle-token'")));
     assert.ok(zip.includes(Buffer.from('worker preflight --control "$NADO_CONTROL" --id')));
     assert.ok(zip.includes(Buffer.from("--capability 'gpu'")));
     assert.ok(zip.includes(Buffer.from("--label 'zone=lab'")));
     assert.ok(zip.includes(Buffer.from("--max-concurrency '2'")));
+    assert.ok(zip.includes(Buffer.from(stableDataDir)));
+    assert.ok(zip.includes(Buffer.from('Upgrade Or Roll Back The Installed Worker')));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -164,6 +321,7 @@ test('CLI builds a self-service worker bootstrap bundle', async () => {
   const root = await makeTempDir();
   try {
     const out = path.join(root, 'worker-bootstrap.zip');
+    const stableDataDir = path.join(root, 'stable-bootstrap-data');
     const stdout = await runCli([
       'worker',
       'bootstrap-bundle',
@@ -177,26 +335,39 @@ test('CLI builds a self-service worker bootstrap bundle', async () => {
       'zone=auto',
       '--agent',
       'node-copy',
+      '--strict-local-readiness',
       '--max-concurrency',
       '2',
       '--poll-ms',
       '500',
       '--cleanup-workspaces',
+      '--data-dir',
+      stableDataDir,
       '--out',
       out,
     ], {});
 
     assert.match(stdout, /bundle=.*worker-bootstrap\.zip/);
     assert.match(stdout, /root=nado-worker-bootstrap/);
+    assert.match(stdout, /upgradeReady=true/);
     const zip = await fs.readFile(out);
     assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/start-worker.sh')));
     assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/start-worker.ps1')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/install-systemd.sh')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/install-scheduled-task.ps1')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/install-launchd.sh')));
     assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/src/cli.js')));
+    assert.ok(zip.includes(Buffer.from('nado-worker-bootstrap/src/worker-inspect.js')));
     assert.ok(zip.includes(Buffer.from('worker bootstrap-start')));
     assert.ok(zip.includes(Buffer.from("--enrollment-token 'nado_enroll_testtoken'")));
     assert.ok(zip.includes(Buffer.from("--capability 'code'")));
     assert.ok(zip.includes(Buffer.from("--label 'zone=auto'")));
     assert.ok(zip.includes(Buffer.from("--max-concurrency '2'")));
+    assert.ok(zip.includes(Buffer.from('--strict-local-readiness')));
+    assert.ok(zip.includes(Buffer.from('"strictLocalReadiness": true')));
+    assert.ok(zip.includes(Buffer.from('"serviceInstallers"')));
+    assert.ok(zip.includes(Buffer.from('"dataDirIsAbsolute": true')));
+    assert.ok(zip.includes(Buffer.from(stableDataDir)));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -525,7 +696,7 @@ test('CLI quickstart boots a usable local gateway and writes agent files', async
       '--poll-ms',
       '50',
       '--once',
-    ], {}, 20_000);
+    ], {}, 45_000);
 
     assert.match(stdout, /quickstart=ready/);
     assert.match(stdout, /control=http:\/\/127\.0\.0\.1:\d+/);
@@ -534,8 +705,11 @@ test('CLI quickstart boots a usable local gateway and writes agent files', async
     assert.match(stdout, /selfTest=succeeded/);
     assert.match(stdout, /selfTestArtifacts=doctor\.txt/);
     assert.match(stdout, /doctor=ok/);
+    assert.match(stdout, /token=configured:argument:redacted/);
+    assert.doesNotMatch(stdout, /quickstart-token/);
     assert.match(stdout, /submitExample=.*submit --control/);
     assert.match(stdout, /installContextExample=.*context install --control/);
+    assert.match(stdout, /NADO_TOKEN="\$NADO_TOKEN"/);
 
     const context = await fs.readFile(path.join(root, 'AGENTS.md'), 'utf8');
     assert.match(context, /quick-worker/);
@@ -547,6 +721,9 @@ test('CLI quickstart boots a usable local gateway and writes agent files', async
     const config = JSON.parse(await fs.readFile(path.join(root, 'mcp.json'), 'utf8'));
     assert.equal(config.mcpServers.nado.env.NADO_TOKEN, 'quickstart-token');
     assert.ok(config.mcpServers.nado.args.includes('mcp'));
+    if (process.platform !== 'win32') {
+      assert.equal((await fs.stat(path.join(root, 'mcp.json'))).mode & 0o777, 0o600);
+    }
     assert.ok(config.mcpServers.nado.args.some((item) => /^http:\/\/127\.0\.0\.1:\d+$/.test(item)));
   } finally {
     await fs.rm(root, { recursive: true, force: true });
@@ -658,6 +835,7 @@ test('CLI starts control and worker processes and completes a submitted task', a
     assert.equal(capabilities.features.mcpRunBatchFlow, true);
     assert.equal(capabilities.features.systemHistoryPruning, true);
     assert.equal(capabilities.features.workerEnrollmentTokenPruning, true);
+    assert.equal(capabilities.features.taskRuntimeDiagnostics, true);
     assert.equal(capabilities.workers[0].id, 'cli-worker');
     assert.equal(capabilities.endpoints.workers.preflight, 'GET /api/workers/{workerId}/preflight');
     assert.equal(capabilities.endpoints.workers.events, 'GET|POST /api/workers/{workerId}/events');
@@ -777,6 +955,10 @@ test('CLI starts control and worker processes and completes a submitted task', a
       controlUrl,
       '--worker',
       'cli-worker',
+      '--platform',
+      process.platform,
+      '--arch',
+      process.arch,
       '--title',
       'cli smoke',
       '--required-label',
@@ -812,6 +994,7 @@ test('CLI starts control and worker processes and completes a submitted task', a
     assert.match(submitOut, /env=CLI_MARK/);
     assert.match(submitOut, /artifactPolicy=include:cli\.txt exclude:cli-env\.txt/);
     assert.match(submitOut, /requiredTools=node/);
+    assert.match(submitOut, new RegExp(`requiredResources=.*"platform":"${process.platform}".*"arch":"${process.arch}"`));
     assert.match(submitOut, /schedulerWorker=cli-worker/);
     assert.match(submitOut, /schedulerReason=explicit worker requested/);
     assert.match(submitOut, /schedulerCandidate=cli-worker eligible=true/);

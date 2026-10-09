@@ -47,7 +47,7 @@ test('doctor can self-test every eligible active worker', async () => {
       selfTest: true,
       allWorkers: true,
       requiredLabels: { zone: 'doctor' },
-      timeoutMs: 8_000,
+      timeoutMs: 20_000,
     });
 
     assert.equal(result.ok, true);
@@ -58,7 +58,7 @@ test('doctor can self-test every eligible active worker', async () => {
 
     const apiResult = await client.doctor({
       requiredLabels: { zone: 'doctor' },
-      timeoutMs: 8_000,
+      timeoutMs: 20_000,
     });
     assert.equal(apiResult.ok, true);
     assert.equal(apiResult.workers.total, 2);

@@ -84,6 +84,98 @@ test('scheduler infers GPU requirements from accelerator-specific task text', ()
   ));
 });
 
+test('scheduler and dispatch preview reject known protocol mismatches but allow legacy unknown workers', () => {
+  const lastSeenAt = new Date().toISOString();
+  const incompatible = {
+    id: 'old-protocol-worker',
+    adminState: 'enabled',
+    lastSeenAt,
+    capabilities: ['code'],
+    maxConcurrency: 1,
+    inventory: { tools: {} },
+    runtime: {
+      id: 'wrun_old_protocol',
+      startedAt: lastSeenAt,
+      build: { version: '9.0.0', protocolVersion: 99, buildId: 'old-release' },
+    },
+  };
+  const legacy = {
+    id: 'legacy-worker',
+    adminState: 'enabled',
+    lastSeenAt,
+    capabilities: ['code'],
+    maxConcurrency: 1,
+    inventory: { tools: {} },
+  };
+  const task = {
+    id: 'task-protocol-gate',
+    title: 'compile project',
+    type: 'shell',
+    command: 'npm run build',
+    requiredCapabilities: ['code'],
+    requestedWorkerId: incompatible.id,
+  };
+
+  const rejected = scheduleTask({ task, workers: [incompatible, legacy], tasks: [] });
+  assert.equal(rejected.workerId, null);
+  assert.equal(rejected.reason, 'explicit worker requested; target not eligible');
+  assert.deepEqual(rejected.candidates[0].reasons, ['protocol mismatch: worker=99 control=1']);
+
+  const acceptedLegacy = scheduleTask({
+    task: { ...task, requestedWorkerId: legacy.id },
+    workers: [incompatible, legacy],
+    tasks: [],
+  });
+  assert.equal(acceptedLegacy.workerId, legacy.id);
+
+  const plan = buildDispatchPlan({
+    tasks: [{ key: 'protocol-gate', ...task, workerId: incompatible.id }],
+  }, { workers: [incompatible, legacy], tasks: [], sessions: [] });
+  assert.equal(plan.items[0].routability.routable, false);
+  assert.deepEqual(plan.items[0].routability.candidates[0].reasons, ['protocol mismatch: worker=99 control=1']);
+  assert.equal(plan.items[0].nextAction.code, 'upgrade_incompatible_worker');
+});
+
+test('scheduler softly prefers the less loaded eligible host from live CPU and memory telemetry', () => {
+  const lastSeenAt = new Date().toISOString();
+  const base = {
+    adminState: 'enabled',
+    lastSeenAt,
+    capabilities: ['code'],
+    maxConcurrency: 2,
+    inventory: { host: { cpus: 16, totalmem: 64 * 1024 ** 3 }, tools: {} },
+  };
+  const scheduling = scheduleTask({
+    task: {
+      id: 'task-host-pressure',
+      title: 'compile project',
+      type: 'shell',
+      command: 'npm run build',
+      requiredCapabilities: ['code'],
+    },
+    workers: [
+      {
+        ...base,
+        id: 'busy-worker',
+        resources: { cpu: { utilizationPercent: 95 }, memory: { usedPercent: 90 } },
+      },
+      {
+        ...base,
+        id: 'quiet-worker',
+        resources: { cpu: { utilizationPercent: 15 }, memory: { usedPercent: 25 } },
+      },
+    ],
+    tasks: [],
+  });
+
+  assert.equal(scheduling.workerId, 'quiet-worker');
+  const quiet = scheduling.candidates.find((candidate) => candidate.workerId === 'quiet-worker');
+  const busy = scheduling.candidates.find((candidate) => candidate.workerId === 'busy-worker');
+  assert.ok(quiet.score > busy.score);
+  assert.ok(busy.reasons.some((reason) => reason === 'host cpu=95% penalty=19'));
+  assert.ok(busy.reasons.some((reason) => reason === 'host memory=90% penalty=9'));
+});
+
 test('scheduler does not infer GPU for ordinary code tasks', () => {
   assert.deepEqual(inferRequiredCapabilitiesForTask({
     title: 'Update dashboard copy',
@@ -726,6 +818,69 @@ test('explicit worker tasks keep target but surface target incompatibility in sc
   }
 });
 
+test('claim rechecks protocol compatibility after a targeted task was scheduled', async () => {
+  const root = await makeTempDir();
+  const token = 'protocol-claim-token';
+  const { server, port } = await startControlServer({
+    host: '127.0.0.1',
+    port: 0,
+    token,
+    dataDir: path.join(root, 'control'),
+  });
+  const client = new NadoClient({ controlUrl: `http://127.0.0.1:${port}`, token });
+  const startedAt = new Date().toISOString();
+
+  try {
+    await client.registerWorker({
+      id: 'protocol-change-worker',
+      capabilities: ['code'],
+      maxConcurrency: 1,
+      inventory: { tools: { node: { available: true, version: process.version } } },
+      runtime: {
+        id: 'wrun_protocol_current',
+        startedAt,
+        build: { version: '0.1.0', protocolVersion: 1, buildId: 'current-release' },
+      },
+    });
+    const created = await client.createTask({
+      title: 'target scheduled before Worker upgrade',
+      type: 'shell',
+      workerId: 'protocol-change-worker',
+      requiredCapabilities: ['code'],
+      command: 'echo should-not-run',
+    });
+    assert.equal(created.task.scheduler.workerId, 'protocol-change-worker');
+
+    await client.registerWorker({
+      id: 'protocol-change-worker',
+      capabilities: ['code'],
+      maxConcurrency: 1,
+      inventory: { tools: { node: { available: true, version: process.version } } },
+      runtime: {
+        id: 'wrun_protocol_future',
+        startedAt: new Date(Date.now() + 1_000).toISOString(),
+        build: { version: '9.0.0', protocolVersion: 99, buildId: 'future-release' },
+      },
+    });
+
+    assert.equal((await client.claimTask('protocol-change-worker')).task, null);
+    const { task } = await client.getTask(created.task.id);
+    assert.equal(task.status, 'queued');
+    assert.equal(task.scheduler.workerId, null);
+    assert.equal(task.scheduler.reason, 'explicit worker requested; target not eligible');
+    assert.ok(task.scheduler.candidates[0].reasons.includes('protocol mismatch: worker=99 control=1'));
+    assert.equal(task.routingNextAction.code, 'upgrade_incompatible_worker');
+    assert.equal(task.events.filter((event) => event.type === 'protocol_incompatible').length, 1);
+
+    await client.claimTask('protocol-change-worker');
+    const repeated = (await client.getTask(created.task.id)).task;
+    assert.equal(repeated.events.filter((event) => event.type === 'protocol_incompatible').length, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('dispatch plan previews scheduler choices without creating tasks', async () => {
   const root = await makeTempDir();
   const token = 'dispatch-plan-token';
@@ -1030,6 +1185,8 @@ test('scheduler filters workers by explicit required tools', async () => {
 test('scheduler normalizes GPU tool aliases', () => {
   assert.equal(normalizeToolName('nvidia-smi'), 'nvidiaSmi');
   assert.equal(normalizeToolName('nvidia'), 'nvidiaSmi');
+  assert.equal(normalizeToolName('amd-smi'), 'amdSmi');
+  assert.equal(normalizeToolName('amdsmi'), 'amdSmi');
   assert.equal(normalizeToolName('rocm-smi'), 'rocmSmi');
   assert.equal(normalizeToolName('rocm'), 'rocmSmi');
 });

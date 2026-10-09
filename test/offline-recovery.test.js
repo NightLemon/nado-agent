@@ -131,6 +131,7 @@ test('offline recovery ignores stale results from superseded task attempts', asy
       type: 'shell',
       workerId: 'lost-worker',
       command: 'echo stale guard',
+      retryBackoffMs: 0,
     });
     const lostClaim = await client.claimTask('lost-worker');
     const lostAttemptId = lostClaim.task.currentAttemptId;

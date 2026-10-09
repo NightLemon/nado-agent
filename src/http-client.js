@@ -29,12 +29,63 @@ function parseContentDispositionFileName(value = '') {
   return null;
 }
 
+function retryAfterMs(response) {
+  const value = String(response.headers.get('retry-after') || '').trim();
+  if (!value) {
+    return 1_000;
+  }
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.ceil(seconds * 1_000));
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 1_000;
+}
+
+function waitForRetry(delayMs, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason || new Error('Request aborted'));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(finish, delayMs);
+    function finish() {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }
+    function abort() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      reject(signal.reason || new Error('Request aborted'));
+    }
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
 export class NadoClient {
-  constructor({ controlUrl, token, workerId = null, privateKeyPem = null }) {
+  constructor({ controlUrl, token, workerId = null, privateKeyPem = null, defaultHeaders = {}, now = null }) {
     this.controlUrl = normalizeBaseUrl(controlUrl);
     this.token = token;
     this.workerId = workerId;
     this.privateKeyPem = privateKeyPem;
+    this.defaultHeaders = { ...defaultHeaders };
+    this.now = typeof now === 'function' ? now : Date.now;
+  }
+
+  async fetchWithRateLimitRetry(method, path, createInit, options = {}) {
+    const safeMethod = ['GET', 'HEAD'].includes(String(method || '').toUpperCase());
+    const maxRetries = safeMethod
+      ? Math.max(0, Math.min(5, Math.floor(Number(options.rateLimitRetries ?? 2))))
+      : 0;
+    for (let attempt = 0; ; attempt += 1) {
+      const init = createInit();
+      const response = await fetch(`${this.controlUrl}${path}`, init);
+      if (response.status !== 429 || attempt >= maxRetries) {
+        return response;
+      }
+      const delayMs = Math.min(60_000, retryAfterMs(response));
+      await response.arrayBuffer().catch(() => {});
+      await waitForRetry(delayMs, init.signal);
+    }
   }
 
   signingHeaders(method, path, bodyText = '') {
@@ -42,7 +93,7 @@ export class NadoClient {
       return {};
     }
     const bodyHash = crypto.createHash('sha256').update(bodyText).digest('hex');
-    const timestamp = String(Date.now());
+    const timestamp = String(this.now());
     const nonce = crypto.randomBytes(12).toString('hex');
     const canonical = [
       String(method || 'GET').toUpperCase(),
@@ -67,12 +118,12 @@ export class NadoClient {
     };
   }
 
-  async request(method, path, body) {
+  async request(method, path, body, options = {}) {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const headers = {
+      ...this.defaultHeaders,
       accept: 'application/json',
       authorization: `Bearer ${this.token}`,
-      ...this.signingHeaders(method, path, payload || ''),
     };
     if (body !== undefined) {
       headers['content-type'] = 'application/json';
@@ -80,11 +131,15 @@ export class NadoClient {
 
     let response;
     try {
-      response = await fetch(`${this.controlUrl}${path}`, {
+      response = await this.fetchWithRateLimitRetry(method, path, () => ({
         method,
-        headers,
+        headers: {
+          ...headers,
+          ...this.signingHeaders(method, path, payload || ''),
+        },
         body: payload,
-      });
+        signal: options.signal,
+      }), options);
     } catch (cause) {
       const error = new Error(`${method} ${path} failed: ${cause.message}`);
       error.method = method;
@@ -104,6 +159,8 @@ export class NadoClient {
       error.controlUrl = this.controlUrl;
       error.status = response.status;
       error.response = data;
+      error.details = data?.details || null;
+      error.expectedOffset = data?.expectedOffset;
       if (data?.dispatchPlan) {
         error.dispatchPlan = data.dispatchPlan;
       }
@@ -115,15 +172,16 @@ export class NadoClient {
     return data;
   }
 
-  async requestText(method, path) {
-    const response = await fetch(`${this.controlUrl}${path}`, {
+  async requestText(method, path, options = {}) {
+    const response = await this.fetchWithRateLimitRetry(method, path, () => ({
       method,
       headers: {
         accept: 'text/plain, text/markdown',
         authorization: `Bearer ${this.token}`,
         ...this.signingHeaders(method, path, ''),
       },
-    });
+      signal: options.signal,
+    }), options);
     const text = await response.text();
     if (!response.ok) {
       throw new Error(`${method} ${path} failed with ${response.status}${text ? `: ${text}` : ''}`);
@@ -131,21 +189,24 @@ export class NadoClient {
     return text;
   }
 
-  async requestBinary(method, path, body) {
+  async requestBinary(method, path, body, options = {}) {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const headers = {
       accept: 'application/octet-stream, application/zip',
       authorization: `Bearer ${this.token}`,
-      ...this.signingHeaders(method, path, payload || ''),
     };
     if (body !== undefined) {
       headers['content-type'] = 'application/json';
     }
-    const response = await fetch(`${this.controlUrl}${path}`, {
+    const response = await this.fetchWithRateLimitRetry(method, path, () => ({
       method,
-      headers,
+      headers: {
+        ...headers,
+        ...this.signingHeaders(method, path, payload || ''),
+      },
       body: payload,
-    });
+      signal: options.signal,
+    }), options);
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`${method} ${path} failed with ${response.status}${text ? `: ${text}` : ''}`);
@@ -175,6 +236,109 @@ export class NadoClient {
           tokenPreview: response.headers.get('x-nado-worker-enrollment-token-preview'),
         }
         : null,
+    };
+  }
+
+  async requestRaw(method, path, body, extraHeaders = {}, options = {}) {
+    const payload = Buffer.isBuffer(body) ? body : Buffer.from(body || '');
+    const headers = {
+      accept: 'application/json',
+      authorization: `Bearer ${this.token}`,
+      'content-type': 'application/octet-stream',
+      'content-length': String(payload.length),
+      ...extraHeaders,
+      ...this.signingHeaders(method, path, payload),
+    };
+    let response;
+    try {
+      response = await fetch(`${this.controlUrl}${path}`, {
+        method,
+        headers,
+        body: payload,
+        signal: options.signal,
+      });
+    } catch (cause) {
+      const error = new Error(`${method} ${path} failed: ${cause.message}`);
+      error.method = method;
+      error.path = path;
+      error.controlUrl = this.controlUrl;
+      error.cause = cause;
+      throw error;
+    }
+    const text = await response.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text ? { error: text } : null;
+    }
+    if (!response.ok) {
+      const detail = data?.error ? `: ${data.error}` : '';
+      const error = new Error(`${method} ${path} failed with ${response.status}${detail}`);
+      error.method = method;
+      error.path = path;
+      error.controlUrl = this.controlUrl;
+      error.status = response.status;
+      error.response = data;
+      error.expectedOffset = data?.expectedOffset;
+      throw error;
+    }
+    return data;
+  }
+
+  async downloadWorkerNetworkProbe(workerId, bytes, options = {}) {
+    const path = `/api/workers/${encodeURIComponent(workerId)}/network-probe/download?bytes=${encodeURIComponent(bytes)}`;
+    const startedAt = performance.now();
+    const response = await fetch(`${this.controlUrl}${path}`, {
+      method: 'GET',
+      headers: {
+        accept: 'application/octet-stream',
+        authorization: `Bearer ${this.token}`,
+        ...this.signingHeaders('GET', path, ''),
+      },
+      signal: AbortSignal.timeout(Math.max(1_000, Number(options.timeoutMs || 10_000))),
+    });
+    const payload = Buffer.from(await response.arrayBuffer());
+    if (!response.ok) {
+      const text = payload.toString('utf8');
+      let detail = text;
+      try {
+        detail = JSON.parse(text)?.error || text;
+      } catch {
+        // Keep the raw response when a proxy returns non-JSON diagnostics.
+      }
+      const error = new Error(`GET ${path} failed with ${response.status}${detail ? `: ${detail}` : ''}`);
+      error.status = response.status;
+      throw error;
+    }
+    const expectedBytes = Number(response.headers.get('x-nado-probe-bytes') || bytes);
+    const expectedSha256 = response.headers.get('x-nado-probe-sha256') || '';
+    const actualSha256 = crypto.createHash('sha256').update(payload).digest('hex');
+    if (payload.length !== expectedBytes || expectedSha256 !== actualSha256) {
+      throw new Error('Network download probe integrity check failed');
+    }
+    return {
+      bytes: payload.length,
+      sha256: actualSha256,
+      durationMs: Math.max(0.1, performance.now() - startedAt),
+    };
+  }
+
+  async uploadWorkerNetworkProbe(workerId, bytes, options = {}) {
+    const path = `/api/workers/${encodeURIComponent(workerId)}/network-probe/upload`;
+    const payload = crypto.randomBytes(Number(bytes));
+    const expectedSha256 = crypto.createHash('sha256').update(payload).digest('hex');
+    const startedAt = performance.now();
+    const result = await this.requestRaw('POST', path, payload, {}, {
+      signal: AbortSignal.timeout(Math.max(1_000, Number(options.timeoutMs || 10_000))),
+    });
+    if (Number(result.bytes) !== payload.length || result.sha256 !== expectedSha256) {
+      throw new Error('Network upload probe integrity check failed');
+    }
+    return {
+      bytes: payload.length,
+      sha256: expectedSha256,
+      durationMs: Math.max(0.1, performance.now() - startedAt),
     };
   }
 
@@ -250,8 +414,8 @@ export class NadoClient {
     return parsed;
   }
 
-  health() {
-    return fetch(`${this.controlUrl}/health`).then(async (response) => {
+  health(options = {}) {
+    return fetch(`${this.controlUrl}/health`, { signal: options.signal }).then(async (response) => {
       const data = await response.json();
       if (!response.ok) {
         throw new Error(`health failed with ${response.status}`);
@@ -268,12 +432,25 @@ export class NadoClient {
     return this.request('GET', '/api/status');
   }
 
+  listAuditEvents(options = {}) {
+    return this.request('GET', `/api/audit${queryString({
+      tail: options.tail,
+      actorType: options.actorType,
+      outcome: options.outcome,
+      statusCode: options.statusCode,
+    })}`);
+  }
+
+  exportAuditEvents(options = {}) {
+    return this.requestText('GET', `/api/audit/export${queryString({ tail: options.tail })}`);
+  }
+
   capabilities() {
     return this.request('GET', '/api/capabilities');
   }
 
-  networkInfo() {
-    return this.request('GET', '/api/network');
+  networkInfo(options = {}) {
+    return this.request('GET', '/api/network', undefined, options);
   }
 
   context() {
@@ -300,6 +477,31 @@ export class NadoClient {
 
   verify(options = {}) {
     return this.request('POST', '/api/verify', options);
+  }
+
+  acceptanceTemplate() {
+    return this.request('GET', '/api/acceptance/template');
+  }
+
+  acceptanceRunbook(options = {}) {
+    return this.request('GET', `/api/acceptance/runbook${queryString({
+      workerId: options.workerId,
+      deploymentMode: options.deploymentMode,
+      overlayInterface: options.overlayInterface,
+      requireGpu: options.requireGpu,
+      requireAgent: options.requireAgent === false ? 'false' : undefined,
+    })}`);
+  }
+
+  recordAcceptanceEvidence(document, record) {
+    return this.request('POST', '/api/acceptance/evidence/record', {
+      document,
+      record,
+    });
+  }
+
+  acceptanceReport(options = {}) {
+    return this.request('POST', '/api/acceptance/report', options);
   }
 
   demoHealth(options = {}) {
@@ -361,6 +563,25 @@ export class NadoClient {
     return this.request('POST', `/api/worker-tokens/${encodeURIComponent(tokenId)}/revoke`, {});
   }
 
+  prepareWorkerTokenRotation(workerId, token, options = {}) {
+    return this.request(
+      'POST',
+      `/api/workers/${encodeURIComponent(workerId)}/token/rotation/prepare`,
+      {
+        token,
+        ...(options.ttlMs ? { ttlMs: options.ttlMs } : {}),
+      },
+    );
+  }
+
+  confirmWorkerTokenRotation(workerId) {
+    return this.request(
+      'POST',
+      `/api/workers/${encodeURIComponent(workerId)}/token/rotation/confirm`,
+      {},
+    );
+  }
+
   getWorker(workerId) {
     return this.request('GET', `/api/workers/${encodeURIComponent(workerId)}`);
   }
@@ -393,16 +614,18 @@ export class NadoClient {
     });
   }
 
-  acknowledgeCommand(workerId, commandId, status = 'completed', message = '') {
+  acknowledgeCommand(workerId, commandId, status = 'completed', message = '', result = null) {
     return this.request(
       'POST',
       `/api/workers/${encodeURIComponent(workerId)}/commands/${encodeURIComponent(commandId)}/ack`,
-      { status, message },
+      { status, message, result },
     );
   }
 
-  claimTask(workerId) {
-    return this.request('POST', `/api/workers/${encodeURIComponent(workerId)}/claim`, {});
+  claimTask(workerId, options = {}) {
+    const waitMs = Math.max(0, Math.floor(Number(options.waitMs || 0)));
+    const path = `/api/workers/${encodeURIComponent(workerId)}/claim${queryString({ waitMs: waitMs || undefined })}`;
+    return this.request('POST', path, {}, { signal: options.signal });
   }
 
   createTask(task) {
@@ -605,6 +828,75 @@ export class NadoClient {
     });
   }
 
+  getTaskInputUpload(taskId, uploadId) {
+    return this.request(
+      'GET',
+      `/api/tasks/${encodeURIComponent(taskId)}/input-uploads/${encodeURIComponent(uploadId)}`,
+    );
+  }
+
+  uploadTaskInputChunk(taskId, uploadId, offset, bytes) {
+    const path = `/api/tasks/${encodeURIComponent(taskId)}/input-uploads/${encodeURIComponent(uploadId)}/chunks${queryString({ offset })}`;
+    const chunk = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+    return this.requestRaw('PATCH', path, chunk, {
+      'x-nado-chunk-sha256': crypto.createHash('sha256').update(chunk).digest('hex'),
+    });
+  }
+
+  finalizeTaskInputUpload(taskId, uploadId) {
+    return this.request(
+      'POST',
+      `/api/tasks/${encodeURIComponent(taskId)}/input-uploads/${encodeURIComponent(uploadId)}/finalize`,
+      {},
+    );
+  }
+
+  async streamTaskInput(taskId, inputId, attemptId, offset = 0, options = {}) {
+    const path = `/api/tasks/${encodeURIComponent(taskId)}/inputs/${encodeURIComponent(inputId)}/download`;
+    let response;
+    try {
+      response = await fetch(`${this.controlUrl}${path}`, {
+        method: 'GET',
+        headers: {
+          accept: 'application/octet-stream',
+          authorization: `Bearer ${this.token}`,
+          range: `bytes=${Math.max(0, Number(offset || 0))}-`,
+          'x-nado-attempt-id': attemptId,
+          ...this.signingHeaders('GET', path, ''),
+        },
+        signal: options.signal,
+      });
+    } catch (cause) {
+      const error = new Error(`GET ${path} failed: ${cause.message}`);
+      error.method = 'GET';
+      error.path = path;
+      error.controlUrl = this.controlUrl;
+      error.cause = cause;
+      throw error;
+    }
+    if (!response.ok) {
+      const text = await response.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = text ? { error: text } : null;
+      }
+      const error = new Error(`GET ${path} failed with ${response.status}${data?.error ? `: ${data.error}` : ''}`);
+      error.status = response.status;
+      error.response = data;
+      throw error;
+    }
+    return {
+      body: response.body,
+      status: response.status,
+      range: response.headers.get('content-range'),
+      size: Number(response.headers.get('x-nado-input-size') || 0),
+      sha256: response.headers.get('x-nado-input-sha256') || null,
+      path: decodeURIComponent(response.headers.get('x-nado-input-path') || ''),
+    };
+  }
+
   listArtifacts(taskId) {
     return this.listTaskArtifacts(taskId);
   }
@@ -652,6 +944,54 @@ export class NadoClient {
 
   addTaskEvent(taskId, event) {
     return this.request('POST', `/api/tasks/${encodeURIComponent(taskId)}/events`, event);
+  }
+
+  recordShortDisconnectObservation(taskId, observation) {
+    return this.request(
+      'POST',
+      `/api/tasks/${encodeURIComponent(taskId)}/acceptance-observations/short-disconnect`,
+      observation,
+    );
+  }
+
+  createArtifactUpload(taskId, artifact, attemptId) {
+    return this.request('POST', `/api/tasks/${encodeURIComponent(taskId)}/artifact-uploads`, {
+      path: artifact.path,
+      size: artifact.size,
+      sha256: artifact.sha256,
+      attemptId,
+    });
+  }
+
+  listArtifactUploads(taskId) {
+    return this.request(
+      'GET',
+      `/api/tasks/${encodeURIComponent(taskId)}/artifact-uploads`,
+    );
+  }
+
+  getArtifactUpload(taskId, uploadId, attemptId) {
+    return this.request(
+      'GET',
+      `/api/tasks/${encodeURIComponent(taskId)}/artifact-uploads/${encodeURIComponent(uploadId)}${queryString({ attemptId })}`,
+    );
+  }
+
+  uploadArtifactChunk(taskId, uploadId, attemptId, offset, bytes) {
+    const path = `/api/tasks/${encodeURIComponent(taskId)}/artifact-uploads/${encodeURIComponent(uploadId)}/chunks${queryString({ offset })}`;
+    const chunk = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+    return this.requestRaw('PATCH', path, chunk, {
+      'x-nado-attempt-id': attemptId,
+      'x-nado-chunk-sha256': crypto.createHash('sha256').update(chunk).digest('hex'),
+    });
+  }
+
+  finalizeArtifactUpload(taskId, uploadId, attemptId) {
+    return this.request(
+      'POST',
+      `/api/tasks/${encodeURIComponent(taskId)}/artifact-uploads/${encodeURIComponent(uploadId)}/finalize`,
+      { attemptId },
+    );
   }
 
   completeTask(taskId, result) {

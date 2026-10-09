@@ -1,5 +1,7 @@
 import { hasLabels, isSubset } from './utils.js';
 import { agentReadinessDiagnostic, gpuResourceDiagnostic } from './worker-diagnostics.js';
+import { resourceFitForTask, taskResourceRequirements } from './resource-model.js';
+import { NADO_PROTOCOL_VERSION, normalizeRuntimeBuild } from './runtime-build.js';
 
 const ACTIVE_WINDOW_MS = 45_000;
 const AGENT_SELF_TEST_RECENT_MS = 24 * 60 * 60 * 1000;
@@ -8,6 +10,8 @@ const GPU_PROBE_DETECTED_BONUS = 15;
 const GPU_ADVERTISED_ONLY_PENALTY = 5;
 const REAL_TERMINAL_AGENT_BONUS = 20;
 const DEMO_ECHO_AGENT_PENALTY = 20;
+const MAX_CPU_PRESSURE_PENALTY = 20;
+const MAX_MEMORY_PRESSURE_PENALTY = 10;
 
 function active(worker) {
   const lastSeen = worker.lastSeenAt ? Date.parse(worker.lastSeenAt) : 0;
@@ -23,6 +27,9 @@ export function normalizeToolName(toolName) {
   if (normalized === 'nvidia-smi' || normalized === 'nvidia') {
     return 'nvidiaSmi';
   }
+  if (normalized === 'amd-smi' || normalized === 'amdsmi') {
+    return 'amdSmi';
+  }
   if (normalized === 'rocm-smi' || normalized === 'rocm') {
     return 'rocmSmi';
   }
@@ -37,6 +44,7 @@ const GPU_TEXT_PATTERNS = [
   { label: 'CUDA keyword', pattern: /\bcuda\b/ },
   { label: 'cuDNN keyword', pattern: /\bcudnn\b/ },
   { label: 'NVIDIA GPU probe', pattern: /\bnvidia-smi\b/ },
+  { label: 'AMD SMI GPU probe', pattern: /\bamd-smi\b/ },
   { label: 'VRAM keyword', pattern: /\bvram\b/ },
   { label: 'ROCm keyword', pattern: /\brocm\b/ },
   { label: 'TensorRT keyword', pattern: /\btensorrt\b/ },
@@ -114,7 +122,61 @@ export const RESOURCE_PREFERENCE_POLICY = {
   preferProbeDetectedGpuWhenGpuRequired: true,
   gpuProbeDetectedBonus: GPU_PROBE_DETECTED_BONUS,
   gpuAdvertisedOnlyPenalty: GPU_ADVERTISED_ONLY_PENALTY,
+  preferLowerHostPressure: true,
+  maxCpuUtilizationPenalty: MAX_CPU_PRESSURE_PENALTY,
+  maxMemoryPressurePenalty: MAX_MEMORY_PRESSURE_PENALTY,
 };
+
+export const PROTOCOL_SCHEDULING_POLICY = {
+  controlProtocolVersion: NADO_PROTOCOL_VERSION,
+  rejectKnownMismatch: true,
+  allowLegacyUnknown: true,
+};
+
+export function protocolReadinessForWorker(worker = {}) {
+  const build = normalizeRuntimeBuild(worker.runtime?.build);
+  const workerProtocolVersion = build?.protocolVersion || null;
+  if (!workerProtocolVersion) {
+    return {
+      eligible: true,
+      status: 'unknown',
+      controlProtocolVersion: NADO_PROTOCOL_VERSION,
+      workerProtocolVersion: null,
+      reasons: [],
+    };
+  }
+  if (workerProtocolVersion !== NADO_PROTOCOL_VERSION) {
+    return {
+      eligible: false,
+      status: 'protocol_mismatch',
+      controlProtocolVersion: NADO_PROTOCOL_VERSION,
+      workerProtocolVersion,
+      reasons: [`protocol mismatch: worker=${workerProtocolVersion} control=${NADO_PROTOCOL_VERSION}`],
+    };
+  }
+  return {
+    eligible: true,
+    status: 'compatible',
+    controlProtocolVersion: NADO_PROTOCOL_VERSION,
+    workerProtocolVersion,
+    reasons: [],
+  };
+}
+
+function finitePercent(value) {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(100, parsed)) : null;
+}
+
+function hostPressure(worker = {}) {
+  return {
+    cpu: finitePercent(worker.resources?.cpu?.utilizationPercent ?? worker.metrics?.cpu?.utilizationPercent),
+    memory: finitePercent(worker.resources?.memory?.usedPercent ?? worker.metrics?.memory?.usedPercent),
+  };
+}
 
 function taskSearchText(task = {}, { includeCommand = true } = {}) {
   return [
@@ -161,9 +223,11 @@ export function explainRequiredCapabilityInferenceForTask(task = {}) {
 }
 
 export function effectiveRequiredCapabilities(task = {}) {
+  const resources = taskResourceRequirements(task);
   return Array.from(new Set([
     ...(task.requiredCapabilities || []),
     ...inferRequiredCapabilitiesForTask(task),
+    ...((resources.gpuCount || resources.gpuMemoryBytes || resources.gpuModel) ? ['gpu'] : []),
   ]));
 }
 
@@ -314,6 +378,10 @@ export function scoreWorkerForTask({ task, worker, tasks, ignoreCurrentCapacity 
   if (worker.adminState !== 'enabled') {
     return { eligible: false, score: null, reasons: [`worker adminState=${worker.adminState}`] };
   }
+  const protocolReadiness = protocolReadinessForWorker(worker);
+  if (!protocolReadiness.eligible) {
+    return { eligible: false, score: null, reasons: protocolReadiness.reasons };
+  }
   const explicitCapabilities = task.requiredCapabilities || [];
   const inferredCapabilities = inferRequiredCapabilitiesForTask(task);
   const requiredCapabilities = effectiveRequiredCapabilities(task);
@@ -332,6 +400,12 @@ export function scoreWorkerForTask({ task, worker, tasks, ignoreCurrentCapacity 
   if (!agentReadiness.eligible) {
     return { eligible: false, score: null, reasons: agentReadiness.reasons };
   }
+
+  const resourceFit = resourceFitForTask(task, worker, peerTasks, { ignoreCurrentCapacity });
+  if (!resourceFit.eligible) {
+    return { eligible: false, score: null, reasons: resourceFit.reasons, resources: resourceFit };
+  }
+  reasons.push(...resourceFit.reasons);
 
   const maxConcurrency = maxConcurrencyForWorker(worker);
   const runningIds = runningTaskIdsForWorker(worker, peerTasks);
@@ -363,6 +437,17 @@ export function scoreWorkerForTask({ task, worker, tasks, ignoreCurrentCapacity 
   score -= failures * 10;
   score += availableSlots * 5;
   reasons.push(`slots=${availableSlots}/${maxConcurrency}`);
+  const pressure = hostPressure(worker);
+  if (pressure.cpu !== null) {
+    const penalty = Math.round((pressure.cpu / 100) * MAX_CPU_PRESSURE_PENALTY);
+    score -= penalty;
+    reasons.push(`host cpu=${pressure.cpu}% penalty=${penalty}`);
+  }
+  if (pressure.memory !== null) {
+    const penalty = Math.round((pressure.memory / 100) * MAX_MEMORY_PRESSURE_PENALTY);
+    score -= penalty;
+    reasons.push(`host memory=${pressure.memory}% penalty=${penalty}`);
+  }
   if (taskSlots > 1) {
     reasons.push(`needs=${taskSlots}`);
   }
@@ -415,7 +500,7 @@ export function scoreWorkerForTask({ task, worker, tasks, ignoreCurrentCapacity 
     reasons.push(...agentReadiness.reasons);
   }
 
-  return { eligible: true, score, reasons };
+  return { eligible: true, score, reasons, resources: resourceFit };
 }
 
 function schedulerWarningsForWorker(task = {}, worker = {}, requiredCapabilities = []) {
@@ -449,6 +534,7 @@ export function scheduleTask({ task, workers, tasks, session }) {
   const inferenceReasons = explainRequiredCapabilityInferenceForTask(task);
   const inferredCapabilities = inferenceReasons.map((item) => item.capability);
   const requiredCapabilities = effectiveRequiredCapabilities(task);
+  const requiredResources = taskResourceRequirements(task);
   if (task.requestedWorkerId) {
     const worker = (workers || []).find((candidate) => candidate.id === task.requestedWorkerId);
     const candidate = worker
@@ -468,6 +554,7 @@ export function scheduleTask({ task, workers, tasks, session }) {
       inferredCapabilities,
       inferenceReasons,
       effectiveRequiredCapabilities: requiredCapabilities,
+      requiredResources,
       warnings: candidate.eligible && worker ? schedulerWarningsForWorker(task, worker, requiredCapabilities) : [],
       candidates: [candidate],
     };
@@ -475,12 +562,31 @@ export function scheduleTask({ task, workers, tasks, session }) {
   if (session?.assignedWorkerId || session?.requestedWorkerId) {
     const workerId = session.assignedWorkerId || session.requestedWorkerId;
     const worker = (workers || []).find((candidate) => candidate.id === workerId);
+    const protocolReadiness = worker ? protocolReadinessForWorker(worker) : null;
+    if (protocolReadiness && !protocolReadiness.eligible) {
+      return {
+        workerId: null,
+        reason: 'session worker affinity; target protocol incompatible',
+        inferredCapabilities,
+        inferenceReasons,
+        effectiveRequiredCapabilities: requiredCapabilities,
+        requiredResources,
+        warnings: [],
+        candidates: [{
+          workerId,
+          eligible: false,
+          score: null,
+          reasons: protocolReadiness.reasons,
+        }],
+      };
+    }
     return {
       workerId,
       reason: 'session worker affinity',
       inferredCapabilities,
       inferenceReasons,
       effectiveRequiredCapabilities: requiredCapabilities,
+      requiredResources,
       warnings: worker ? schedulerWarningsForWorker(task, worker, requiredCapabilities) : [],
       candidates: [],
     };
@@ -506,6 +612,7 @@ export function scheduleTask({ task, workers, tasks, session }) {
       inferredCapabilities,
       inferenceReasons,
       effectiveRequiredCapabilities: requiredCapabilities,
+      requiredResources,
       warnings: [],
       candidates,
     };
@@ -518,6 +625,7 @@ export function scheduleTask({ task, workers, tasks, session }) {
     inferredCapabilities,
     inferenceReasons,
     effectiveRequiredCapabilities: requiredCapabilities,
+    requiredResources,
     warnings: selectedWorker ? schedulerWarningsForWorker(task, selectedWorker, requiredCapabilities) : [],
     candidates,
   };

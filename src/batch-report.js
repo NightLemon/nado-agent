@@ -1,4 +1,4 @@
-const TASK_STATUSES = ['queued', 'blocked', 'running', 'succeeded', 'failed', 'cancelled'];
+const TASK_STATUSES = ['uploading_inputs', 'queued', 'blocked', 'running', 'succeeded', 'failed', 'cancelled'];
 
 function normalizeArtifactGroups(groups) {
   if (!groups) {
@@ -97,6 +97,7 @@ export function buildBatchReport(batch, tasks, options = {}) {
   const blockedTasks = taskReports.filter((task) => task.status === 'blocked');
   const runningTasks = taskReports.filter((task) => task.status === 'running');
   const queuedTasks = taskReports.filter((task) => task.status === 'queued');
+  const uploadingInputTasks = taskReports.filter((task) => task.status === 'uploading_inputs');
   const artifactTotal = taskReports.reduce((sum, task) => sum + task.artifactCount, 0);
 
   return {
@@ -116,7 +117,14 @@ export function buildBatchReport(batch, tasks, options = {}) {
     blockedTasks,
     runningTasks,
     queuedTasks,
-    nextActions: suggestNextActions(batch, { problemTasks, blockedTasks, runningTasks, queuedTasks }),
+    uploadingInputTasks,
+    nextActions: suggestNextActions(batch, {
+      problemTasks,
+      blockedTasks,
+      runningTasks,
+      queuedTasks,
+      uploadingInputTasks,
+    }),
   };
 }
 
@@ -131,6 +139,9 @@ function suggestNextActions(batch, groups) {
   if (groups.runningTasks.length || groups.queuedTasks.length) {
     actions.push('Use batch events --watch for live progress and batch wait to block until the batch is terminal.');
   }
+  if (groups.uploadingInputTasks.length) {
+    actions.push('Resume or cancel unfinished control-side input uploads; these tasks are not schedulable until every input is finalized.');
+  }
   if (batch.status === 'succeeded') {
     actions.push('Download or inspect artifacts; all child tasks reached succeeded.');
   }
@@ -144,7 +155,7 @@ export function formatBatchReport(report) {
   lines.push(`title=${report.batch.title}`);
   lines.push(`status=${report.batch.status}`);
   lines.push(`completed=${report.batch.completedTasks}/${report.batch.totalTasks}`);
-  lines.push(`counts=queued:${counts.queued} blocked:${counts.blocked} running:${counts.running} succeeded:${counts.succeeded} failed:${counts.failed} cancelled:${counts.cancelled}`);
+  lines.push(`counts=uploading_inputs:${counts.uploading_inputs} queued:${counts.queued} blocked:${counts.blocked} running:${counts.running} succeeded:${counts.succeeded} failed:${counts.failed} cancelled:${counts.cancelled}`);
   lines.push(`artifacts=${report.batch.artifactTotal}`);
 
   if (report.problemTasks.length) {

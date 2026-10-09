@@ -64,13 +64,23 @@ test('task and batch env values are injected without overriding reserved NADO va
       env: {
         CUSTOM_VALUE: 'task-env',
         NADO_WORKER_ID: 'spoofed',
+        NADO_ATTEMPT_ID: 'spoofed-attempt',
+        NADO_ATTEMPT_SEQ: '999',
+        NADO_WORKER_RUNTIME_ID: 'spoofed-runtime',
       },
-      command: 'node -e "const fs=require(\'fs\'); fs.writeFileSync(\'env.txt\', process.env.CUSTOM_VALUE+\':\'+process.env.NADO_WORKER_ID)"',
+      command: 'node -e "const fs=require(\'fs\'); fs.writeFileSync(\'env.txt\', [process.env.CUSTOM_VALUE,process.env.NADO_WORKER_ID,process.env.NADO_ATTEMPT_ID,process.env.NADO_ATTEMPT_SEQ,process.env.NADO_WORKER_RUNTIME_ID].join(\':\'))"',
     });
     assert.equal(taskCreated.task.env.CUSTOM_VALUE, 'task-env');
     const taskDone = await waitForTask(client, taskCreated.task.id);
     assert.equal(taskDone.status, 'succeeded');
-    assert.equal(await fs.readFile(path.join(taskDone.workspace, 'env.txt'), 'utf8'), 'task-env:env-worker');
+    const taskEnv = (await fs.readFile(path.join(taskDone.workspace, 'env.txt'), 'utf8')).split(':');
+    assert.equal(taskEnv[0], 'task-env');
+    assert.equal(taskEnv[1], 'env-worker');
+    assert.match(taskEnv[2], /^attempt_/);
+    assert.equal(taskEnv[3], '1');
+    assert.match(taskEnv[4], /^wrun_[a-f0-9]{32}$/);
+    const { worker: runtimeWorker } = await client.getWorker('env-worker');
+    assert.equal(taskEnv[4], runtimeWorker.runtime.id);
 
     const batchCreated = await client.createBatch({
       title: 'batch env',

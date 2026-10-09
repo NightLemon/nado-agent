@@ -202,6 +202,7 @@ function taskCreateRequestFromMcpArgs(args = {}) {
     requiredCapabilities,
     requiredTools: toolsFromValue(args.tools),
     requiredLabels: labelsFromObject(args.labels || args.requiredLabels),
+    requiredResources: args.requiredResources,
     env: envFromObject(args.env),
     artifactPolicy: artifactPolicyFromObject(args.artifactPolicy),
     dependencyArtifacts: args.dependencyArtifacts,
@@ -212,6 +213,11 @@ function taskCreateRequestFromMcpArgs(args = {}) {
     requireRoutable: args.requireRoutable,
     inputFiles: args.inputFiles || [],
     timeoutMs: args.timeoutMs,
+    maxAttempts: args.maxAttempts,
+    retryPolicy: args.retryPolicy,
+    retryBackoffMs: args.retryBackoffMs,
+    maxRetryBackoffMs: args.maxRetryBackoffMs,
+    idempotencyKey: args.idempotencyKey,
   };
 }
 
@@ -273,6 +279,35 @@ const dependencyArtifactsSchema = {
   ],
 };
 
+const resourceRequirementsSchema = {
+  type: 'object',
+  properties: {
+    platform: { type: 'string' },
+    arch: { type: 'string' },
+    cpuCores: { type: 'number' },
+    memoryBytes: { oneOf: [{ type: 'number' }, { type: 'string' }] },
+    gpuCount: { type: 'number' },
+    gpuMemoryBytes: { oneOf: [{ type: 'number' }, { type: 'string' }] },
+    gpuModel: { type: 'string' },
+  },
+  additionalProperties: false,
+};
+
+const retryPolicySchema = {
+  type: 'object',
+  properties: {
+    failureKinds: {
+      type: 'array',
+      items: { type: 'string', enum: ['timeout', 'process_error', 'worker_error', 'nonzero_exit'] },
+    },
+    exitCodes: {
+      type: 'array',
+      items: { type: 'number' },
+    },
+  },
+  additionalProperties: false,
+};
+
 const taskSubmitProperties = {
   title: { type: 'string' },
   type: { type: 'string', enum: ['shell', 'agent'] },
@@ -304,6 +339,7 @@ const taskSubmitProperties = {
     type: 'object',
     additionalProperties: { type: 'string' },
   },
+  requiredResources: resourceRequirementsSchema,
   env: {
     type: 'object',
     additionalProperties: { type: 'string' },
@@ -322,6 +358,11 @@ const taskSubmitProperties = {
   keepWorkspace: { type: 'boolean' },
   requireRoutable: { type: 'boolean' },
   timeoutMs: { type: 'number' },
+  maxAttempts: { type: 'number' },
+  retryPolicy: retryPolicySchema,
+  retryBackoffMs: { type: 'number' },
+  maxRetryBackoffMs: { type: 'number' },
+  idempotencyKey: { type: 'string' },
 };
 
 const batchDefaultsProperties = {
@@ -340,6 +381,7 @@ const batchDefaultsProperties = {
     type: 'object',
     additionalProperties: { type: 'string' },
   },
+  requiredResources: resourceRequirementsSchema,
   env: {
     type: 'object',
     additionalProperties: { type: 'string' },
@@ -359,6 +401,10 @@ const batchDefaultsProperties = {
   timeoutMs: { type: 'number' },
   requireRoutable: { type: 'boolean' },
   maxOutputChars: { type: 'number' },
+  maxAttempts: { type: 'number' },
+  retryPolicy: retryPolicySchema,
+  retryBackoffMs: { type: 'number' },
+  maxRetryBackoffMs: { type: 'number' },
   inputFiles: {
     type: 'array',
     items: {
@@ -397,6 +443,7 @@ const batchTaskProperties = {
     type: 'object',
     additionalProperties: { type: 'string' },
   },
+  requiredResources: resourceRequirementsSchema,
   env: {
     type: 'object',
     additionalProperties: { type: 'string' },
@@ -427,6 +474,10 @@ const batchTaskProperties = {
     },
   },
   timeoutMs: { type: 'number' },
+  maxAttempts: { type: 'number' },
+  retryPolicy: retryPolicySchema,
+  retryBackoffMs: { type: 'number' },
+  maxRetryBackoffMs: { type: 'number' },
   requireRoutable: { type: 'boolean' },
 };
 
@@ -481,6 +532,7 @@ const distributedPlannerProperties = {
   capabilities: { type: 'array', items: { type: 'string' } },
   tools: { type: 'array', items: { type: 'string' } },
   labels: { type: 'object', additionalProperties: { type: 'string' } },
+  requiredResources: resourceRequirementsSchema,
   slots: { type: 'number' },
   priority: { type: 'number' },
   keepWorkspace: { type: 'boolean' },
@@ -519,6 +571,51 @@ function mapMcpTaskInput(input = {}) {
   }
   return mapped;
 }
+
+const acceptanceScenarioSchema = {
+  type: 'object',
+  properties: {
+    status: { type: 'string', enum: ['passed', 'failed', 'pending'] },
+    evidence: { type: 'string' },
+    note: { type: 'string' },
+    references: { type: 'array', items: { type: 'string' } },
+    observedAt: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+    source: { type: 'string', enum: ['operator', 'automated_exercise', 'supervised_exercise'] },
+    details: { type: 'object' },
+    description: { type: 'string' },
+  },
+  additionalProperties: false,
+};
+
+const acceptanceEvidenceSchema = {
+  type: 'object',
+  properties: {
+    version: { type: 'number' },
+    generatedAt: { type: 'string' },
+    updatedAt: { type: 'string' },
+    scenarios: {
+      type: 'object',
+      additionalProperties: acceptanceScenarioSchema,
+    },
+  },
+  additionalProperties: false,
+};
+
+const acceptanceRecordSchema = {
+  type: 'object',
+  required: ['scenario', 'status'],
+  properties: {
+    scenario: { type: 'string' },
+    status: { type: 'string', enum: ['passed', 'failed', 'pending'] },
+    evidence: { type: 'string' },
+    note: { type: 'string' },
+    references: { type: 'array', items: { type: 'string' } },
+    observedAt: { type: 'string' },
+    source: { type: 'string', enum: ['operator', 'automated_exercise', 'supervised_exercise'] },
+    details: { type: 'object' },
+  },
+  additionalProperties: false,
+};
 
 const toolSchemas = [
   {
@@ -637,6 +734,67 @@ const toolSchemas = [
     },
   },
   {
+    name: 'nado_acceptance_template',
+    description: 'Return the versioned strict cross-site acceptance evidence template, including every supported physical, WAN, recovery, transfer, credential, and Agent scenario.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nado_acceptance_runbook',
+    description: 'Build the versioned, ordered, resumable VM/home-Worker acceptance runbook from the same source used by CLI and Dashboard. Operator-only evidence placeholders remain commented and the final step is the strict completeness gate.',
+    inputSchema: {
+      type: 'object',
+      required: ['workerId'],
+      properties: {
+        workerId: { type: 'string' },
+        deploymentMode: { type: 'string', enum: ['public_https', 'tailscale', 'wireguard'] },
+        overlayInterface: { type: 'string' },
+        requireGpu: { type: 'boolean' },
+        requireAgent: { type: 'boolean' },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nado_record_acceptance_evidence',
+    description: 'Validate and record one operator or exercise result into a cross-site acceptance evidence document. Omit document to start from a fresh complete template.',
+    inputSchema: {
+      type: 'object',
+      required: ['record'],
+      properties: {
+        document: acceptanceEvidenceSchema,
+        record: acceptanceRecordSchema,
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nado_acceptance_report',
+    description: 'Build the strict cross-site acceptance report for one target Worker. Deployment-boundary evidence is required by default; set requireDeploymentEvidence=false only for a diagnostic preview. Automatic live checks and operator-recorded physical/WAN evidence remain separate; optionally run target-pinned end-to-end verification tasks.',
+    inputSchema: {
+      type: 'object',
+      required: ['workerId'],
+      properties: {
+        workerId: { type: 'string' },
+        requireGpu: { type: 'boolean' },
+        requireAgent: { type: 'boolean' },
+        runVerify: { type: 'boolean' },
+        timeoutMs: { type: 'number' },
+        manualEvidence: acceptanceEvidenceSchema,
+        requireDeploymentEvidence: {
+          type: 'boolean',
+          default: true,
+          description: 'Require a valid deployment-check receipt bound to the current Control URL. Defaults to true; disable only for a non-final diagnostic preview.',
+        },
+        deploymentEvidence: { type: 'object', additionalProperties: true },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'nado_demo_health',
     description: 'Return one operator-oriented live demo health summary with Dashboard URL, network diagnostics, worker inventory, automatic GPU/docs/PPT route checks, optional readiness verification, and optional diagnostic history cleanup.',
     inputSchema: {
@@ -745,6 +903,7 @@ const toolSchemas = [
         agentPreset: { type: 'string', enum: ['codex', 'claude', 'node-copy'] },
         agentCommand: { type: 'string' },
         maxConcurrency: { type: 'number' },
+        strictLocalReadiness: { type: 'boolean' },
         cleanupWorkspaces: { type: 'boolean' },
         pollMs: { type: 'number' },
         dataDir: { type: 'string' },
@@ -1075,6 +1234,7 @@ const toolSchemas = [
           type: 'object',
           additionalProperties: { type: 'string' },
         },
+        requiredResources: resourceRequirementsSchema,
         reason: { type: 'string' },
       },
       additionalProperties: false,
@@ -1102,6 +1262,7 @@ const toolSchemas = [
           type: 'object',
           additionalProperties: { type: 'string' },
         },
+        requiredResources: resourceRequirementsSchema,
       },
       additionalProperties: false,
     },
@@ -1224,6 +1385,7 @@ const toolSchemas = [
           type: 'object',
           additionalProperties: { type: 'string' },
         },
+        requiredResources: resourceRequirementsSchema,
         reason: { type: 'string' },
       },
       additionalProperties: false,
@@ -1251,6 +1413,7 @@ const toolSchemas = [
           type: 'object',
           additionalProperties: { type: 'string' },
         },
+        requiredResources: resourceRequirementsSchema,
         reason: { type: 'string' },
       },
       additionalProperties: false,
@@ -1445,6 +1608,33 @@ async function callTool(client, name, args = {}, config = {}) {
       skipDoctor: Boolean(args.skipDoctor),
     }));
   }
+  if (name === 'nado_acceptance_template') {
+    return textResult(await client.acceptanceTemplate());
+  }
+  if (name === 'nado_acceptance_runbook') {
+    return textResult(await client.acceptanceRunbook({
+      workerId: args.workerId,
+      deploymentMode: args.deploymentMode,
+      overlayInterface: args.overlayInterface,
+      requireGpu: Boolean(args.requireGpu),
+      requireAgent: args.requireAgent !== false,
+    }));
+  }
+  if (name === 'nado_record_acceptance_evidence') {
+    return textResult(await client.recordAcceptanceEvidence(args.document, args.record));
+  }
+  if (name === 'nado_acceptance_report') {
+    return textResult(await client.acceptanceReport({
+      workerId: args.workerId,
+      requireGpu: Boolean(args.requireGpu),
+      requireAgent: args.requireAgent !== false,
+      runVerify: Boolean(args.runVerify),
+      timeoutMs: args.timeoutMs || 60_000,
+      manualEvidence: args.manualEvidence || {},
+      requireDeploymentEvidence: args.requireDeploymentEvidence !== false,
+      deploymentEvidence: args.deploymentEvidence || null,
+    }));
+  }
   if (name === 'nado_demo_health') {
     return textResult(await client.demoHealth({
       skipVerify: Boolean(args.skipVerify),
@@ -1569,6 +1759,7 @@ async function callTool(client, name, args = {}, config = {}) {
       agentPreset: agentOptions.agentPreset,
       agentCommand: args.agentCommand || null,
       maxConcurrency: args.maxConcurrency || null,
+      strictLocalReadiness: Boolean(args.strictLocalReadiness),
       cleanupWorkspaces: Boolean(args.cleanupWorkspaces),
       pollMs: args.pollMs || null,
       dataDir: args.dataDir || '.nado',
@@ -1738,6 +1929,9 @@ async function callTool(client, name, args = {}, config = {}) {
     if (args.labels !== undefined) {
       options.requiredLabels = labelsFromObject(args.labels);
     }
+    if (args.requiredResources !== undefined) {
+      options.requiredResources = args.requiredResources;
+    }
     return textResult(await client.manageBatch(args.batchId, args.action, options));
   }
   if (name === 'nado_create_session') {
@@ -1750,6 +1944,7 @@ async function callTool(client, name, args = {}, config = {}) {
       requiredCapabilities,
       requiredTools: toolsFromValue(args.tools),
       requiredLabels: labelsFromObject(args.labels || args.requiredLabels),
+      requiredResources: args.requiredResources,
     }));
   }
   if (name === 'nado_list_sessions') {
@@ -1803,6 +1998,9 @@ async function callTool(client, name, args = {}, config = {}) {
     if (args.labels !== undefined) {
       options.requiredLabels = labelsFromObject(args.labels);
     }
+    if (args.requiredResources !== undefined) {
+      options.requiredResources = args.requiredResources;
+    }
     return textResult(await client.manageTask(args.taskId, args.action, options));
   }
   if (name === 'nado_recover_offline_tasks') {
@@ -1829,6 +2027,9 @@ async function callTool(client, name, args = {}, config = {}) {
     }
     if (args.labels !== undefined) {
       options.requiredLabels = labelsFromObject(args.labels);
+    }
+    if (args.requiredResources !== undefined) {
+      options.requiredResources = args.requiredResources;
     }
     return textResult(await client.recoverOfflineTasks(options));
   }

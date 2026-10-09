@@ -3,11 +3,13 @@ import {
   agentReadinessForTask,
   effectiveRequiredCapabilities,
   missingRequiredTools,
+  protocolReadinessForWorker,
   scheduleTask,
   taskSlotCost,
 } from './scheduler.js';
 import { routingActionHint } from './routing-diagnostics.js';
 import { hasLabels, isSubset, safeName } from './utils.js';
+import { normalizeResourceRequirements, resourceFitForTask } from './resource-model.js';
 
 const ACTIVE_WINDOW_MS = 45_000;
 
@@ -66,6 +68,10 @@ function mergeTask(defaults = {}, task = {}, index = 0) {
     ...labels(defaults.requiredLabels || defaults.labels),
     ...labels(task.requiredLabels || task.labels),
   };
+  merged.requiredResources = {
+    ...normalizeResourceRequirements(defaults.requiredResources || defaults.resources),
+    ...normalizeResourceRequirements(task.requiredResources || task.resources),
+  };
   if (firstDefined(task.slots, task.taskSlots, defaults.slots, defaults.taskSlots) !== undefined) {
     merged.slots = Number(firstDefined(task.slots, task.taskSlots, defaults.slots, defaults.taskSlots));
   }
@@ -76,6 +82,7 @@ function mergeTask(defaults = {}, task = {}, index = 0) {
   delete merged.tools;
   delete merged.labels;
   delete merged.taskSlots;
+  delete merged.resources;
   return merged;
 }
 
@@ -90,6 +97,10 @@ function routabilityForWorker(task, worker) {
   }
   if (worker.adminState !== 'enabled') {
     reasons.push(`worker adminState=${worker.adminState}`);
+  }
+  const protocolReadiness = protocolReadinessForWorker(worker);
+  if (!protocolReadiness.eligible) {
+    reasons.push(...protocolReadiness.reasons);
   }
   const agentReadiness = agentReadinessForTask(task, worker);
   if (!agentReadiness.eligible) {
@@ -111,6 +122,10 @@ function routabilityForWorker(task, worker) {
   const maxConcurrency = Math.max(1, Number(worker.maxConcurrency || 1));
   if (taskSlots > maxConcurrency) {
     reasons.push(`task slots ${taskSlots} exceed worker capacity ${maxConcurrency}`);
+  }
+  const resourceFit = resourceFitForTask(task, worker, [], { ignoreCurrentCapacity: true });
+  if (!resourceFit.eligible) {
+    reasons.push(...resourceFit.reasons);
   }
   return {
     workerId: worker.id,
@@ -192,6 +207,7 @@ export function buildDispatchPlan(input = {}, snapshot = {}) {
       effectiveRequiredCapabilities: scheduler.effectiveRequiredCapabilities || task.requiredCapabilities || [],
       requiredTools: task.requiredTools || [],
       requiredLabels: task.requiredLabels || {},
+      requiredResources: task.requiredResources || {},
       slots: task.slots || 1,
       scheduler,
       routability,
@@ -205,6 +221,7 @@ export function buildDispatchPlan(input = {}, snapshot = {}) {
         status: 'queued',
         requestedWorkerId: scheduler.workerId,
         slots: task.slots || 1,
+        requiredResources: task.requiredResources || {},
       });
     }
   });
